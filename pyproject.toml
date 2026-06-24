@@ -46,7 +46,7 @@ packages = [
 version = "0.2.0"
 
 [tool.poetry.group.dev.dependencies]
-ruff = ">=0.15.18"
+ruff = ">=0.15.19"
 bandit = ">=1.7"
 docstr-coverage = "^2.3.2"
 complexipy = ">=5.6.1"
