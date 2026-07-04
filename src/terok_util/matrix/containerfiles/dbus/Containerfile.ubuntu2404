@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+
+# Ubuntu 24.04 (Noble) — dbus + dbusmock deps, system Python 3.12
+FROM docker.io/library/ubuntu:24.04
+
+{% include "_apt-dbus-slot.j2" %}

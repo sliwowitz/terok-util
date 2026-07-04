@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+
+# Ubuntu 26.04 (Resolute) — dbus + dbusmock deps, next LTS
+FROM docker.io/library/ubuntu:26.04
+
+{% include "_apt-dbus-slot.j2" %}

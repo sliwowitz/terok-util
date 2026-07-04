@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+
+# Fedora 44 — dbus + dbusmock deps, looking forward to the next Fedora line
+FROM registry.fedoraproject.org/fedora:44
+
+{% include "_dnf-dbus-slot.j2" %}

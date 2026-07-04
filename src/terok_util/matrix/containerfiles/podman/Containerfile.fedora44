@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+
+# Fedora 44 — podman 5.x line, pasta default, looking forward
+FROM registry.fedoraproject.org/fedora:44
+
+{% include "_dnf-podman-slot.j2" %}

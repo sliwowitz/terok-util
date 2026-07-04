@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+
+# Ubuntu 26.04 (Resolute) — next LTS, pulls in a newer podman than 24.04
+FROM docker.io/library/ubuntu:26.04
+
+{% include "_apt-podman-slot.j2" %}

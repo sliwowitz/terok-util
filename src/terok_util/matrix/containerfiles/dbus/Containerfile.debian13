@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+
+# Debian 13 (Trixie) — dbus + dbusmock deps, system Python 3.12+
+FROM docker.io/library/debian:trixie
+
+{% include "_apt-dbus-slot.j2" %}
