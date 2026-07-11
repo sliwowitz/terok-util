@@ -29,6 +29,7 @@ from .catalog import (
     RESULTS_MOUNT,
     SLOTS,
     SOURCE_MOUNT,
+    UV_MANAGED_PYTHON_DIR,
     WORKSPACE_DIR,
     SlotKind,
 )
@@ -196,6 +197,7 @@ def _nix_python_report(slot_name: str) -> list[str]:
 def _uv_or_venv_bootstrap(installer: str = "poetry") -> list[str]:
     """Fast uv venv when the image ships uv, stdlib venv otherwise."""
     return [
+        *_venv_scrub_and_python_home(),
         *(_uv_no_python_downloads() if installer == "uv" else []),
         "if command -v uv >/dev/null 2>&1; then",
         f"    uv venv --python {PYTHON_VERSION} .venv",
@@ -258,9 +260,27 @@ def _uv_no_python_downloads() -> list[str]:
     return ["export UV_PYTHON_DOWNLOADS=never"]
 
 
+def _venv_scrub_and_python_home() -> list[str]:
+    """Reset harness venv state that does not survive the workspace copy.
+
+    The source tree is copied wholesale, so a checkout's in-project
+    ``.venv`` arrives with entry-point shebangs pointing at absolute
+    paths from the original machine — scrub it; the harness always
+    builds its own.  The managed-interpreter home must be re-exported
+    because ``su - <test user>`` wipes the image ENV that declared it
+    (see ``UV_MANAGED_PYTHON_DIR``); without it, distros whose image
+    provisions Python via uv re-download it per run or fail outright.
+    """
+    return [
+        "rm -rf .venv",
+        f"export UV_PYTHON_INSTALL_DIR={UV_MANAGED_PYTHON_DIR}",
+    ]
+
+
 def _plain_venv_bootstrap(python: str, installer: str = "poetry") -> list[str]:
     """Stdlib venv on a fixed interpreter — the nix wrapper must stay in play."""
     lines = [
+        "rm -rf .venv",
         "# The venv inherits the wrapper's sys.path scrubbing, which is the",
         "# wrapped-Python failure mode this slot exists to exercise.",
         f"{python} -m venv .venv",

@@ -25,7 +25,15 @@ from jinja2 import Environment, PackageLoader, StrictUndefined
 
 from terok_util.security import sanitize_tty
 
-from .catalog import OWNERSHIP_LABEL, RESULTS_MOUNT, SLOTS, SOURCE_MOUNT, UV_IMAGE_TAG, SlotKind
+from .catalog import (
+    OWNERSHIP_LABEL,
+    RESULTS_MOUNT,
+    SLOTS,
+    SOURCE_MOUNT,
+    UV_IMAGE_TAG,
+    UV_MANAGED_PYTHON_DIR,
+    SlotKind,
+)
 from .config import MatrixConfig
 from .inner import inner_script, outer_script
 
@@ -57,7 +65,8 @@ def render_containerfile(config: MatrixConfig, slot_name: str) -> str:
     kind = SLOTS[slot_name].kind
     flavor = "nix" if kind is SlotKind.NIX else config.flavor
     rendered = _TEMPLATES.get_template(f"{flavor}/Containerfile.{slot_name}").render(
-        uv_tag=UV_IMAGE_TAG
+        uv_tag=UV_IMAGE_TAG,
+        uv_python_dir=UV_MANAGED_PYTHON_DIR,
     )
     fragment = config.containers_dir / "fragments" / f"Containerfile.{slot_name}"
     if fragment.is_file():

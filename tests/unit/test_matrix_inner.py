@@ -132,6 +132,8 @@ def test_inner_uv_repo_syncs_with_uv_and_runs_bare_pytest(tmp_path: Path) -> Non
 
     assert "uv sync --locked --active --no-default-groups --group test --group stories" in inner
     assert inner.index("export UV_PYTHON_DOWNLOADS=never") < inner.index("uv venv")
+    assert inner.index("rm -rf .venv") < inner.index("uv venv")
+    assert "export UV_PYTHON_INSTALL_DIR=/opt/uv/python" in inner
     assert "pytest tests/integration/ -v --tb=short" in inner
     assert "poetry run pytest" not in inner
     assert "poetry install" not in inner
@@ -148,3 +150,17 @@ def test_inner_uv_nix_slot_installs_uv_into_the_wrapped_venv(tmp_path: Path) -> 
     assert "pip install --quiet uv" in inner
     assert "uv sync --locked --active --no-default-groups --group test --group docs" in inner
     assert ".poetry-venv" not in inner
+
+
+def test_inner_scrubs_stale_venv_and_finds_managed_python(tmp_path: Path) -> None:
+    """Both installers scrub a copied-in .venv and re-export the managed
+    interpreter home — image ENV does not survive the su drop, and a stale
+    checkout venv carries dead absolute shebangs."""
+    poetry_inner = inner_script(load_fixture(tmp_path), "debian13")
+    assert "rm -rf .venv" in poetry_inner
+    assert "export UV_PYTHON_INSTALL_DIR=/opt/uv/python" in poetry_inner
+    assert "UV_PYTHON_DOWNLOADS" not in poetry_inner  # poetry mode may still download
+
+    (tmp_path / "uv.lock").touch()
+    nix_inner = inner_script(load_fixture(tmp_path), "nix")
+    assert "rm -rf .venv" in nix_inner
