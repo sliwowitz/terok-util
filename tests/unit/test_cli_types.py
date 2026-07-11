@@ -6,10 +6,19 @@
 from __future__ import annotations
 
 import argparse
+import os.path
+import sys
 
 import pytest
 
-from terok_util.cli_types import ArgDef, CommandDef, CommandTree, KeyRow
+from terok_util.cli_types import (
+    ArgDef,
+    CommandDef,
+    CommandTree,
+    KeyRow,
+    LazyHandler,
+    _resolve_handler,
+)
 
 
 def _leaf(name: str, handler=None) -> CommandDef:
@@ -405,3 +414,198 @@ class TestKeyRow:
         scope, comment, _, _, _, _ = row
         assert (scope, comment) == ("s", "c")
         assert row.scope == "s"
+
+
+class TestLazyHandler:
+    """A [`LazyHandler`][terok_util.cli_types.LazyHandler] imports its target
+    only when called, never at tree-build time — and stays transparent to
+    dispatch (sync and async alike)."""
+
+    def test_construction_does_not_import(self) -> None:
+        """Constructing over a missing module must not raise — only calling does."""
+        handler = LazyHandler("terok_util._no_such_module_xyz:fn")
+        with pytest.raises(ModuleNotFoundError):
+            handler()
+
+    def test_resolves_and_invokes_positionally(self) -> None:
+        assert LazyHandler("os.path:join")("a", "b") == os.path.join("a", "b")
+
+    def test_dotted_qualname_walks_attributes(self) -> None:
+        """A dotted qualname resolves nested attributes on the imported module."""
+        import collections
+
+        assert _resolve_handler("collections:abc.Mapping") is collections.abc.Mapping
+
+    def test_missing_separator_raises(self) -> None:
+        with pytest.raises(ValueError, match="module:qualname"):
+            LazyHandler("no_colon_here")()
+
+    def test_resolution_is_cached(self) -> None:
+        assert _resolve_handler("os.path:join") is _resolve_handler("os.path:join")
+
+    def test_resolve_returns_the_underlying_callable(self) -> None:
+        """`resolve()` hands back the real target for introspection (e.g. signatures)."""
+        assert LazyHandler("os.path:join").resolve() is os.path.join
+
+    def test_wiring_a_tree_does_not_import_the_target(self, tmp_path, monkeypatch) -> None:
+        """Building + wiring the tree must not import the handler module."""
+        (tmp_path / "lazy_wire_target.py").write_text(
+            "calls = []\n\ndef run(*, n=0):\n    calls.append(n)\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        assert "lazy_wire_target" not in sys.modules
+
+        cmd = CommandDef(
+            name="v",
+            handler=LazyHandler("lazy_wire_target:run"),
+            args=(ArgDef(name="--n", type=int, default=0),),
+        )
+        parser = argparse.ArgumentParser()
+        CommandTree([cmd]).wire(parser)
+        assert "lazy_wire_target" not in sys.modules  # still cold after wiring
+
+        CommandTree.dispatch(parser.parse_args(["v", "--n", "3"]))
+        import lazy_wire_target
+
+        assert lazy_wire_target.calls == [3]  # imported + invoked at dispatch
+
+    def test_dispatch_runs_lazy_async_handler(self, tmp_path, monkeypatch) -> None:
+        """The coroutine returned by a lazily-resolved async handler still runs."""
+        (tmp_path / "lazy_async_target.py").write_text(
+            "calls = []\n\nasync def run():\n    calls.append(1)\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+
+        tree = CommandTree([CommandDef(name="v", handler=LazyHandler("lazy_async_target:run"))])
+        parser = argparse.ArgumentParser()
+        tree.wire(parser)
+        CommandTree.dispatch(parser.parse_args(["v"]))
+        import lazy_async_target
+
+        assert lazy_async_target.calls == [1]
+
+
+class TestLazyDispatch:
+    """A lazy root ([`CommandDef.source`][terok_util.cli_types.CommandDef])
+    resolves to its real definition only when the verb is invoked, so a
+    multi-subsystem CLI imports one verb's module per run."""
+
+    @staticmethod
+    def _write_verb(tmp_path, module: str, verb: str, body: str = "") -> None:
+        """Write a throwaway module exposing ``VERB`` — a CommandDef named *verb*."""
+        (tmp_path / f"{module}.py").write_text(
+            "from terok_util.cli_types import ArgDef, CommandDef\n"
+            f"{body}"
+            f"VERB = CommandDef(name={verb!r}, help={verb + ' help'!r}, handler=lambda: None)\n"
+        )
+
+    def test_lazy_flag_and_resolve(self, tmp_path, monkeypatch) -> None:
+        self._write_verb(tmp_path, "lz_resolve", "v")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        lazy = CommandDef(name="v", help="v help", source="lz_resolve:VERB")
+        assert lazy.is_lazy is True
+        assert lazy.resolve().name == "v" and lazy.resolve().source is None
+
+    def test_wire_loads_only_the_invoked_verb(self, tmp_path, monkeypatch) -> None:
+        self._write_verb(tmp_path, "lz_a", "a")
+        self._write_verb(tmp_path, "lz_b", "b")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        tree = CommandTree(
+            [
+                CommandDef(name="a", help="ah", source="lz_a:VERB"),
+                CommandDef(name="b", help="bh", source="lz_b:VERB"),
+            ]
+        )
+        assert "lz_a" not in sys.modules and "lz_b" not in sys.modules
+        tree.wire(argparse.ArgumentParser(), argv=["a", "--flag"])
+        assert "lz_a" in sys.modules  # the invoked verb resolved
+        assert "lz_b" not in sys.modules  # its sibling stayed a placeholder
+
+    def test_help_lists_placeholders_without_loading(self, tmp_path, monkeypatch) -> None:
+        self._write_verb(tmp_path, "lz_help", "h1")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        tree = CommandTree([CommandDef(name="h1", help="h1 help", source="lz_help:VERB")])
+        parser = argparse.ArgumentParser()
+        tree.wire(parser, argv=["--help"])
+        assert "lz_help" not in sys.modules  # nothing resolved for a bare --help
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--help"])  # argparse still lists the placeholder
+
+    def test_completion_env_forces_full_tree(self, tmp_path, monkeypatch) -> None:
+        self._write_verb(tmp_path, "lz_comp", "c1")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setenv("_ARGCOMPLETE", "1")
+        tree = CommandTree([CommandDef(name="c1", help="ch", source="lz_comp:VERB")])
+        tree.wire(argparse.ArgumentParser(), argv=["c1"])
+        assert "lz_comp" in sys.modules  # completion needs the whole surface
+
+    def test_argv_none_wires_everything(self, tmp_path, monkeypatch) -> None:
+        self._write_verb(tmp_path, "lz_eager", "e1")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        tree = CommandTree([CommandDef(name="e1", help="eh", source="lz_eager:VERB")])
+        tree.wire(argparse.ArgumentParser())  # no argv → back-compat full wire
+        assert "lz_eager" in sys.modules
+
+    def test_dispatch_through_a_lazy_root(self, tmp_path, monkeypatch) -> None:
+        (tmp_path / "lz_disp.py").write_text(
+            "from terok_util.cli_types import ArgDef, CommandDef\n"
+            "calls = []\n"
+            "def run(*, n=0):\n    calls.append(n)\n"
+            "VERB = CommandDef(name='d1', help='dh', "
+            "args=(ArgDef(name='--n', type=int, default=0),), handler=run)\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        tree = CommandTree([CommandDef(name="d1", help="dh", source="lz_disp:VERB")])
+        parser = argparse.ArgumentParser()
+        tree.wire(parser, argv=["d1", "--n", "5"])
+        CommandTree.dispatch(parser.parse_args(["d1", "--n", "5"]))
+        import lz_disp
+
+        assert lz_disp.calls == [5]
+
+
+class TestLazyComposition:
+    """Lazy nodes stay transparent to the tree-composition operations
+    (``find_at`` / ``extend_at`` / ``overlay`` / ``walk``), so a consumer
+    can splice and compose a registry it received as lazy roots."""
+
+    @staticmethod
+    def _write_group(tmp_path, module: str, group: str, child: str) -> None:
+        (tmp_path / f"{module}.py").write_text(
+            "from terok_util.cli_types import CommandDef\n"
+            f"GROUP = CommandDef(name={group!r}, help='g', "
+            f"children=(CommandDef(name={child!r}, help='c', handler=lambda: None),))\n"
+        )
+
+    def test_extend_at_resolves_a_lazy_target(self, tmp_path, monkeypatch) -> None:
+        """Appending under a lazy root keeps its real children (the executor case)."""
+        self._write_group(tmp_path, "lz_ext", "vault", "status")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        tree = CommandTree([CommandDef(name="vault", help="vh", source="lz_ext:GROUP")])
+        extended = tree.extend_at(
+            ("vault",), [CommandDef(name="serve", help="sv", handler=lambda: None)]
+        )
+        names = [c.name for c in extended.find_at(("vault",)).children]
+        assert names == ["status", "serve"]  # real child preserved, addition appended
+
+    def test_find_at_descends_through_a_lazy_node(self, tmp_path, monkeypatch) -> None:
+        self._write_group(tmp_path, "lz_find", "vault", "status")
+        monkeypatch.syspath_prepend(str(tmp_path))
+        tree = CommandTree([CommandDef(name="vault", help="vh", source="lz_find:GROUP")])
+        assert tree.find_at(("vault", "status")).name == "status"
+
+    def test_nested_lazy_child_wires_in_full(self, tmp_path, monkeypatch) -> None:
+        """A lazy root spliced as a child materialises when its branch is wired."""
+        (tmp_path / "lz_child.py").write_text(
+            "from terok_util.cli_types import ArgDef, CommandDef\n"
+            "VERB = CommandDef(name='notify', help='n', "
+            "args=(ArgDef(name='message'),), handler=lambda **k: None)\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        lazy_child = CommandDef(name="notify", help="n", source="lz_child:VERB")
+        group = CommandDef(name="dbus", help="d", children=(lazy_child,))
+        parser = argparse.ArgumentParser()
+        CommandTree([group]).wire(parser)  # eager wire of the whole tree
+        # The nested lazy child's positional arg parses — proof it materialised.
+        args = parser.parse_args(["dbus", "notify", "hello"])
+        assert args.message == "hello"
