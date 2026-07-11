@@ -131,7 +131,7 @@ def test_inner_uv_repo_syncs_with_uv_and_runs_bare_pytest(tmp_path: Path) -> Non
     inner = inner_script(load_fixture(tmp_path), "debian13")
 
     assert "uv sync --locked --active --no-default-groups --group test --group stories" in inner
-    assert "export UV_PYTHON_DOWNLOADS=never" in inner
+    assert inner.index("export UV_PYTHON_DOWNLOADS=never") < inner.index("uv venv")
     assert "pytest tests/integration/ -v --tb=short" in inner
     assert "poetry run pytest" not in inner
     assert "poetry install" not in inner

@@ -11,7 +11,8 @@ its three levels of quote-escaping is gone:
   a writable workspace, prove the init system matches the slot's
   contract, then drop to the slot's test user;
 * the **inner** script runs as the test user: export the capability
-  contract, bootstrap a Python 3.12 venv + Poetry, install the repo, and
+  contract, bootstrap a Python 3.12 venv plus the repo's installer
+  (poetry, or uv for repos shipping ``uv.lock``), install the repo, and
   walk the configured phases.
 
 Command phases abort the slot on failure (``set -e``); pytest phases
@@ -195,6 +196,7 @@ def _nix_python_report(slot_name: str) -> list[str]:
 def _uv_or_venv_bootstrap(installer: str = "poetry") -> list[str]:
     """Fast uv venv when the image ships uv, stdlib venv otherwise."""
     return [
+        *(_uv_no_python_downloads() if installer == "uv" else []),
         "if command -v uv >/dev/null 2>&1; then",
         f"    uv venv --python {PYTHON_VERSION} .venv",
         "else",
@@ -238,16 +240,22 @@ def _venv_uv() -> list[str]:
 
     Unlike poetry, uv needs no isolation from the project venv: it is a
     single static binary with no importable modules the project's own
-    build-isolation stack could race against.  ``UV_PYTHON_DOWNLOADS=never``
-    pins uv to the interpreter under test — a silently downloaded
-    interpreter would defeat the per-distro python matrix.
+    build-isolation stack could race against.
     """
     return [
         "if ! command -v uv >/dev/null 2>&1; then",
         "    pip install --quiet uv",
         "fi",
-        "export UV_PYTHON_DOWNLOADS=never",
     ]
+
+
+def _uv_no_python_downloads() -> list[str]:
+    """Pin uv to the interpreter under test, before uv runs at all.
+
+    A silently downloaded CPython would defeat the per-distro python
+    matrix, so the export must precede even ``uv venv``.
+    """
+    return ["export UV_PYTHON_DOWNLOADS=never"]
 
 
 def _plain_venv_bootstrap(python: str, installer: str = "poetry") -> list[str]:
@@ -267,7 +275,7 @@ def _plain_venv_bootstrap(python: str, installer: str = "poetry") -> list[str]:
             'export PATH="$HOME/.poetry-venv/bin:$PATH"',
         ]
     else:
-        lines += _venv_uv()
+        lines += _uv_no_python_downloads() + _venv_uv()
     return lines
 
 
