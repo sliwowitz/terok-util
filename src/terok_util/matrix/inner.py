@@ -69,12 +69,14 @@ def inner_script(config: MatrixConfig, slot_name: str, scope: str = "all") -> st
     lines += _env_contract(config, slot_name)
     lines += ["", f"cd {WORKSPACE_DIR}", ""]
     if spec.kind is SlotKind.NIX:
-        lines += _nix_python_report(slot_name) + _plain_venv_bootstrap(f"python{PYTHON_VERSION}")
+        lines += _nix_python_report(slot_name)
+        lines += _plain_venv_bootstrap(f"python{PYTHON_VERSION}", config.installer)
     else:
         if config.flavor == "podman":
             lines += _podman_report_and_preflight(slot_name)
-        lines += _uv_or_venv_bootstrap()
-    lines += _poetry_install(config.slot_poetry_groups(slot_name))
+        lines += _uv_or_venv_bootstrap(config.installer)
+    groups = config.slot_poetry_groups(slot_name)
+    lines += _uv_sync(groups) if config.installer == "uv" else _poetry_install(groups)
     lines += _phase_walk(config, slot_name, scope)
     return "\n".join(lines) + "\n"
 
@@ -190,7 +192,7 @@ def _nix_python_report(slot_name: str) -> list[str]:
     ]
 
 
-def _uv_or_venv_bootstrap() -> list[str]:
+def _uv_or_venv_bootstrap(installer: str = "poetry") -> list[str]:
     """Fast uv venv when the image ships uv, stdlib venv otherwise."""
     return [
         "if command -v uv >/dev/null 2>&1; then",
@@ -204,7 +206,7 @@ def _uv_or_venv_bootstrap() -> list[str]:
         'echo "--- python version ---"',
         "python --version",
         "",
-        *_isolated_poetry(),
+        *(_isolated_poetry() if installer == "poetry" else _venv_uv()),
     ]
 
 
@@ -231,19 +233,42 @@ def _isolated_poetry() -> list[str]:
     ]
 
 
-def _plain_venv_bootstrap(python: str) -> list[str]:
-    """Stdlib venv on a fixed interpreter — the nix wrapper must stay in play."""
+def _venv_uv() -> list[str]:
+    """Make uv usable from the active venv when the image lacks it.
+
+    Unlike poetry, uv needs no isolation from the project venv: it is a
+    single static binary with no importable modules the project's own
+    build-isolation stack could race against.  ``UV_PYTHON_DOWNLOADS=never``
+    pins uv to the interpreter under test — a silently downloaded
+    interpreter would defeat the per-distro python matrix.
+    """
     return [
+        "if ! command -v uv >/dev/null 2>&1; then",
+        "    pip install --quiet uv",
+        "fi",
+        "export UV_PYTHON_DOWNLOADS=never",
+    ]
+
+
+def _plain_venv_bootstrap(python: str, installer: str = "poetry") -> list[str]:
+    """Stdlib venv on a fixed interpreter — the nix wrapper must stay in play."""
+    lines = [
         "# The venv inherits the wrapper's sys.path scrubbing, which is the",
         "# wrapped-Python failure mode this slot exists to exercise.",
         f"{python} -m venv .venv",
         ". .venv/bin/activate",
         "",
-        f'{python} -m venv "$HOME/.poetry-venv"',
-        '"$HOME/.poetry-venv/bin/pip" install --quiet --upgrade pip',
-        '"$HOME/.poetry-venv/bin/pip" install --quiet poetry',
-        'export PATH="$HOME/.poetry-venv/bin:$PATH"',
     ]
+    if installer == "poetry":
+        lines += [
+            f'{python} -m venv "$HOME/.poetry-venv"',
+            '"$HOME/.poetry-venv/bin/pip" install --quiet --upgrade pip',
+            '"$HOME/.poetry-venv/bin/pip" install --quiet poetry',
+            'export PATH="$HOME/.poetry-venv/bin:$PATH"',
+        ]
+    else:
+        lines += _venv_uv()
+    return lines
 
 
 def _poetry_install(groups: tuple[str, ...]) -> list[str]:
@@ -255,17 +280,35 @@ def _poetry_install(groups: tuple[str, ...]) -> list[str]:
     ]
 
 
+def _uv_sync(groups: tuple[str, ...]) -> list[str]:
+    """Install the repo with exactly the configured dependency groups.
+
+    ``--no-default-groups`` mirrors poetry's ``--with`` semantics: runtime
+    dependencies plus precisely the listed groups, regardless of what the
+    repo's ``[tool.uv] default-groups`` says.  ``--active`` targets the
+    venv the bootstrap just activated.
+    """
+    flags = " ".join(f"--group {group}" for group in groups)
+    return [
+        f"uv sync --locked --active --no-default-groups {flags}".rstrip(),
+        'echo "--- deps installed ---"',
+    ]
+
+
 def _phase_walk(config: MatrixConfig, slot_name: str, scope: str) -> list[str]:
     """Render the configured phases; aggregate pytest failures into one rc."""
     lines = ["", "_rc=0"]
     expect_nonempty = bool(config.slot_expect(slot_name))
+    # uv mode syncs into the activated venv, so bare ``pytest`` resolves
+    # there; poetry keeps its own env and needs the ``run`` prefix.
+    pytest_runner = "pytest" if config.installer == "uv" else "poetry run pytest"
     for phase in config.slot_phases(slot_name):
         if phase.pytest and scope != "all" and phase.scope != scope:
             continue
         lines += ["", 'echo ""', f'echo "--- {phase.name} ---"']
         if phase.pytest:
             lines += [
-                f"poetry run pytest {phase.pytest} \\",
+                f"{pytest_runner} {phase.pytest} \\",
                 '    || { _prc=$?; if [ "$_rc" -eq 0 ]; then _rc=$_prc; fi; }',
             ]
         else:
