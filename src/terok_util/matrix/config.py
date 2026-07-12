@@ -46,7 +46,7 @@ class Phase:
     Args:
         name: Human-readable heading printed before the phase.
         run: Shell commands executed in order (command phase).
-        pytest: Arguments to ``poetry run pytest`` (pytest phase).
+        pytest: Arguments to ``pytest`` (pytest phase).
         scope: Optional ``unit``/``integ`` tag; scope-filtered runs execute
             only pytest phases carrying the requested tag.
         expect_add: Capability names appended to ``TEROK_EXPECT`` after the
@@ -72,7 +72,7 @@ class SlotConfig:
         skip_arches: Host architectures (``uname -m``) the slot is skipped
             on, with ``skip_reason`` explaining why.
         skip_reason: Human-readable reason shown for the skip.
-        poetry_groups: Override of the repo-level dependency groups.
+        groups: Override of the repo-level dependency groups.
         expect: Override of the repo-level capability contract.
         phases: Override of the repo-level phase list.
     """
@@ -80,7 +80,7 @@ class SlotConfig:
     extra_packages: tuple[str, ...] = ()
     skip_arches: tuple[str, ...] = ()
     skip_reason: str = ""
-    poetry_groups: tuple[str, ...] | None = None
+    groups: tuple[str, ...] | None = None
     expect: tuple[str, ...] | None = None
     phases: tuple[Phase, ...] | None = None
 
@@ -92,7 +92,7 @@ class MatrixConfig:
     Args:
         image_prefix: Image/container name prefix and prune-label value.
         flavor: Shared Containerfile family (``podman`` or ``dbus``).
-        poetry_groups: Dependency groups installed before testing.
+        groups: Dependency groups synced before testing.
         expect: ``TEROK_EXPECT`` capability contract; empty = not exported.
         slots: Selected slots in declaration order.
         phases: Repo-level test flow.
@@ -102,17 +102,17 @@ class MatrixConfig:
 
     image_prefix: str
     flavor: str
-    poetry_groups: tuple[str, ...]
+    groups: tuple[str, ...]
     expect: tuple[str, ...]
     slots: dict[str, SlotConfig]
     phases: tuple[Phase, ...]
     containers_dir: Path
     repo_root: Path
 
-    def slot_poetry_groups(self, name: str) -> tuple[str, ...]:
+    def slot_groups(self, name: str) -> tuple[str, ...]:
         """Dependency groups effective for slot ``name``."""
-        override = self.slots[name].poetry_groups
-        return self.poetry_groups if override is None else override
+        override = self.slots[name].groups
+        return self.groups if override is None else override
 
     def slot_expect(self, name: str) -> tuple[str, ...]:
         """Capability contract effective for slot ``name``."""
@@ -147,7 +147,7 @@ def load_config(path: Path) -> MatrixConfig:
     config = MatrixConfig(
         image_prefix=data.string("image-prefix"),
         flavor=flavor,
-        poetry_groups=data.strings("poetry-groups", default=("test",)),
+        groups=data.strings("groups", default=("test",)),
         expect=data.strings("expect", default=()),
         slots=_parse_slots(data.mapping("slots"), where=str(path)),
         phases=_parse_phases(data.list_of_maps("phases"), where=str(path)),
@@ -176,7 +176,7 @@ def _parse_slots(raw: dict[str, Any], where: str) -> dict[str, SlotConfig]:
             extra_packages=section.strings("extra-packages", default=()),
             skip_arches=skip.strings("arches", default=()),
             skip_reason=skip.string("reason", default=""),
-            poetry_groups=section.strings_or_none("poetry-groups"),
+            groups=section.strings_or_none("groups"),
             expect=section.strings_or_none("expect"),
             phases=_parse_slot_phases(section, where=f"{where}: slot {name}"),
         )

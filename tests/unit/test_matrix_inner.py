@@ -64,7 +64,7 @@ def test_inner_walks_phases_in_order_and_aggregates_pytest_failures(tmp_path: Pa
     with_hooks = inner.index("integration tests with hooks")
     assert without < setup < with_hooks
     assert inner.count('if [ "$_rc" -eq 0 ]; then _rc=$_prc; fi') == 2
-    assert "poetry run stack-under-test config 2>&1 || true" in inner
+    assert "stack-under-test config 2>&1 || true" in inner
     assert inner.rstrip().endswith("exit $_rc")
 
 
@@ -88,12 +88,7 @@ def test_inner_podman_flavor_reports_and_preflights(tmp_path: Path) -> None:
     assert "/results/debian13.podman-version" in inner
     assert "rootless podman not functional" in inner
     assert "uv venv --python 3.12 .venv" in inner
-    assert "poetry install --with test --with stories --no-interaction" in inner
-    # Poetry is isolated from the project venv - installing the project's
-    # deps must never replace poetry's own build machinery mid-run.
-    assert "uv tool install -q poetry" in inner
-    assert "uv pip install poetry" not in inner
-    assert '"$HOME/.poetry-venv/bin:$PATH"' in inner
+    assert "uv sync --locked --active --no-default-groups --group test --group stories" in inner
 
 
 def test_inner_nix_slot_reports_python_with_its_declared_contract(tmp_path: Path) -> None:
@@ -107,7 +102,7 @@ def test_inner_nix_slot_reports_python_with_its_declared_contract(tmp_path: Path
     assert "export TEROK_MATRIX=1" in inner
     assert "TEROK_EXPECT" not in inner
     assert "XDG_RUNTIME_DIR" not in inner
-    assert "poetry install --with test --with docs --no-interaction" in inner
+    assert "uv sync --locked --active --no-default-groups --group test --group docs" in inner
 
 
 def test_inner_dbus_flavor_has_no_podman_machinery(tmp_path: Path) -> None:
@@ -118,3 +113,43 @@ def test_inner_dbus_flavor_has_no_podman_machinery(tmp_path: Path) -> None:
     assert "export TEROK_EXPECT=dbus-daemon" in inner
     assert "podman" not in inner
     assert "resolv" not in outer_script(config, "debian13")
+
+
+def test_inner_syncs_locked_groups_and_runs_bare_pytest(tmp_path: Path) -> None:
+    """Deps come from ``uv sync`` against the lockfile; pytest phases run bare.
+
+    ``--no-default-groups`` keeps the install declarative (runtime deps +
+    exactly the listed groups), and the sync targets the venv the bootstrap
+    activated, so no runner prefix is needed.
+    """
+    inner = inner_script(load_fixture(tmp_path), "debian13")
+
+    assert "uv sync --locked --active --no-default-groups --group test --group stories" in inner
+    assert inner.index("export UV_PYTHON_DOWNLOADS=never") < inner.index("uv venv")
+    assert inner.index("rm -rf .venv") < inner.index("uv venv")
+    assert "export UV_PYTHON_INSTALL_DIR=/opt/uv/python" in inner
+    assert "pytest tests/integration/ -v --tb=short" in inner
+    assert "poetry" not in inner
+
+
+def test_inner_nix_slot_installs_uv_into_the_wrapped_venv(tmp_path: Path) -> None:
+    """The nix slot keeps its stdlib venv on the wrapped interpreter; uv rides
+    inside that venv."""
+    inner = inner_script(load_fixture(tmp_path), "nix")
+
+    assert "python3.12 -m venv .venv" in inner
+    assert "pip install --quiet uv" in inner
+    assert "uv sync --locked --active --no-default-groups --group test --group docs" in inner
+
+
+def test_inner_scrubs_stale_venv_and_finds_managed_python(tmp_path: Path) -> None:
+    """Every slot kind scrubs a copied-in .venv and re-exports the managed
+    interpreter home — image ENV does not survive the su drop, and a stale
+    checkout venv carries dead absolute shebangs."""
+    for slot in ("debian13", "nix"):
+        inner = inner_script(load_fixture(tmp_path), slot)
+        assert "rm -rf .venv" in inner
+        assert "export UV_PYTHON_DOWNLOADS=never" in inner
+    assert "export UV_PYTHON_INSTALL_DIR=/opt/uv/python" in inner_script(
+        load_fixture(tmp_path), "debian13"
+    )
