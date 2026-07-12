@@ -39,9 +39,11 @@ CYAN = "\033[1;36m" if _TTY else ""
 YELLOW = "\033[1;33m" if _TTY else ""
 GREEN = "\033[1;32m" if _TTY else ""
 RED = "\033[1;31m" if _TTY else ""
-MAGENTA = "\033[1;35m" if _TTY else ""
-BLUE = "\033[1;34m" if _TTY else ""
 DIM = "\033[2m" if _TTY else ""
+# Slot-tag color for -j output: one color for ALL tags (color encodes
+# message type, not source identity).  A dimmed steel blue where the
+# terminal speaks 256 colors, plain dim elsewhere.
+TAG = "\033[2;38;5;67m" if _TTY and "256color" in os.environ.get("TERM", "") else DIM
 RESET = "\033[0m" if _TTY else ""
 
 
@@ -195,13 +197,15 @@ def _run_slots_tagged(
 
 
 def _slot_prefixes(names: list[str]) -> dict[str, str]:
-    """Aligned, per-slot colored ``[slot] `` line tags."""
-    palette = [CYAN, GREEN, YELLOW, MAGENTA, BLUE, RED]
+    """Aligned ``[slot] `` line tags, uniform and unobtrusive.
+
+    One color for all tags: in this codebase color encodes message
+    *type* (pass/fail/skip), not source identity — a rainbow of tags
+    would read as ten different severities.  See ``TAG`` for the
+    dim-blue/plain-dim terminal split.
+    """
     width = max(len(name) for name in names)
-    return {
-        name: f"{palette[i % len(palette)]}[{name:<{width}}]{RESET} "
-        for i, name in enumerate(names)
-    }
+    return {name: f"{TAG}[{name:<{width}}]{RESET} " for name in names}
 
 
 def _print_verdict(config: MatrixConfig, name: str, result: SlotResult) -> None:
