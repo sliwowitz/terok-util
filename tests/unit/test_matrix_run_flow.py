@@ -418,6 +418,52 @@ def test_version_mismatch_is_a_warning_not_a_failure(
     assert "PASS" in out
 
 
+# ── cli: the wall-time closer ──────────────────────────────────────
+
+
+def _scripted_clock(monkeypatch: pytest.MonkeyPatch, *readings: float) -> None:
+    """Script the walk's clock seam: one reading per ``_monotonic_now`` call."""
+    clock = iter(readings)
+    monkeypatch.setattr(cli, "_monotonic_now", lambda: next(clock))
+
+
+def test_wall_time_is_the_runs_last_line(
+    tmp_path: Path,
+    stubbed_host: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The wall-time line closes the run, after the summary and the prune."""
+    monkeypatch.setattr(cli.platform, "machine", lambda: "x86_64")
+    _scripted_clock(monkeypatch, 100.0, 100.0 + 12 * 60 + 34)
+
+    assert cli.main(_args(tmp_path)) == 0
+
+    out = capsys.readouterr().out
+    assert out.splitlines()[-1] == "Matrix wall time: 0:12:34"
+    assert out.index("===== Matrix Summary =====") < out.index("pruned") < out.index("wall time")
+
+
+def test_wall_time_survives_an_interrupt(
+    tmp_path: Path,
+    stubbed_host: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ctrl-C still reports how long the run lived — it rides the teardown finally."""
+    monkeypatch.setattr(cli.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(cli, "run_slot", _raise_interrupt)
+    _scripted_clock(monkeypatch, 0.0, 42.0)
+
+    assert cli.main(_args(tmp_path)) == 130
+
+    assert "Matrix wall time: 0:00:42" in capsys.readouterr().out
+
+
+def _raise_interrupt(*_args: Any, **_kwargs: Any) -> runner.SlotResult:
+    raise KeyboardInterrupt
+
+
 # ── cli: keyring preflight ─────────────────────────────────────────
 
 
