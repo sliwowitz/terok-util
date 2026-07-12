@@ -52,7 +52,7 @@ packages = [
 version = "0.2.2a1"
 
 [tool.poetry.group.dev.dependencies]
-ruff = ">=0.15.20"
+ruff = ">=0.15.21"
 bandit = ">=1.7"
 docstr-coverage = "^2.3.2"
 complexipy = ">=6.0.1"
@@ -60,7 +60,7 @@ vulture = ">=2.12"
 reuse = "^6.2.0"
 tach = "^0.35.0"
 pre-commit = ">=4.0"
-mypy = ">=2.1.0,<3.0"
+mypy = ">=2.2.0,<3.0"
 
 [tool.poetry.group.test.dependencies]
 pytest = ">=9.1.1"
@@ -69,7 +69,7 @@ pytest-cov = ">=4.0"
 [tool.poetry.group.docs.dependencies]
 properdocs = ">=1.6.7"
 mkdocs-material = ">=9.7.6"
-mkdocstrings = {extras = ["python"], version = ">=0.26"}
+mkdocstrings = {extras = ["python"], version = ">=1.0.6"}
 mkdocs-literate-nav = ">=0.6"
 mkdocs-section-index = ">=0.3"
 mkdocs-terok = "^0.7.4"
