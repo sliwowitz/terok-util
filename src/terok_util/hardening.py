@@ -1,0 +1,139 @@
+# SPDX-FileCopyrightText: 2026 Jiri Vyskocil
+# SPDX-License-Identifier: Apache-2.0
+
+"""Process self-hardening — shrink what a leaked address space can reveal.
+
+A process that holds secret material (a vault DB session key, an SSH
+private key) wants three cheap kernel-level guarantees the moment it
+starts, before it opens anything sensitive:
+
+* **No ptrace / no debugger attach** — ``prctl(PR_SET_DUMPABLE, 0)``
+  clears the dumpable flag, so another process in the same user (a
+  compromised sibling) cannot ``ptrace`` the address space and cannot
+  read ``/proc/<pid>/mem``.  It also stops the kernel writing a core
+  dump for this process.
+* **No core dumps** — ``setrlimit(RLIMIT_CORE, 0)`` belt-and-braces the
+  dumpable clear: even a SIGSEGV can't spill the heap (keys included)
+  to a file on disk.
+* **No swap-out** — ``mlockall(MCL_CURRENT | MCL_FUTURE)`` pins the
+  pages into RAM so secret bytes never land in the swap file where they
+  outlive the process.  This one is best-effort: it needs
+  ``CAP_IPC_LOCK`` or a generous ``RLIMIT_MEMLOCK`` and legitimately
+  fails in a locked-down rootless container — a failure is reported,
+  never raised.
+
+[`harden_self`][terok_util.hardening.harden_self] applies all three to
+the *current* process and returns a [`HardeningReport`][terok_util.hardening.HardeningReport]
+of what actually took.  It is the floor every isolated child process
+(terok-sandbox's split supervisor children) calls at start-up, before
+per-service seccomp / Landlock profiles narrow things further.
+
+Linux-only by construction — the primitives are Linux syscalls.  On any
+other platform (or a kernel that lacks one) the corresponding field
+comes back ``False`` and nothing raises.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import resource
+import sys
+from dataclasses import dataclass
+
+#: ``prctl`` option number for the dumpable flag (``linux/prctl.h``).
+_PR_SET_DUMPABLE = 4
+
+#: ``mlockall`` flags (``bits/mman-linux.h``): lock resident pages now
+#: and every page mapped hereafter.
+_MCL_CURRENT = 1
+_MCL_FUTURE = 2
+
+
+@dataclass(frozen=True)
+class HardeningReport:
+    """What [`harden_self`][terok_util.hardening.harden_self] managed to apply.
+
+    Each field is ``True`` only when the corresponding guarantee is in
+    force for the current process.  ``no_dump`` and ``no_core`` are
+    expected to succeed anywhere the syscalls exist; ``memory_locked``
+    routinely comes back ``False`` in a rootless container without
+    ``CAP_IPC_LOCK`` and that is not an error — the caller decides
+    whether to log it.
+    """
+
+    #: ``prctl(PR_SET_DUMPABLE, 0)`` succeeded — no ptrace, no core dump.
+    no_dump: bool
+    #: ``RLIMIT_CORE`` is pinned to zero.
+    no_core: bool
+    #: ``mlockall`` succeeded — no page of this process can swap out.
+    memory_locked: bool
+
+    @property
+    def fully_hardened(self) -> bool:
+        """``True`` when all three guarantees are in force."""
+        return self.no_dump and self.no_core and self.memory_locked
+
+
+def harden_self() -> HardeningReport:
+    """Apply the process-hardening floor to the current process.
+
+    Idempotent and side-effecting: clears the dumpable flag, zeroes the
+    core-dump limit, and locks memory — each independently, so a failure
+    of one (typically ``mlockall`` for lack of privilege) still lets the
+    others take.  Never raises; the returned
+    [`HardeningReport`][terok_util.hardening.HardeningReport] says what
+    held.
+
+    Call this as early as possible in a process that will hold secret
+    material — before opening the credential store or binding a socket —
+    so the sensitive bytes are only ever mapped under the guarantees.
+    """
+    if sys.platform != "linux":
+        return HardeningReport(no_dump=False, no_core=False, memory_locked=False)
+
+    libc = _libc()
+    return HardeningReport(
+        no_dump=_clear_dumpable(libc),
+        no_core=_zero_core_limit(),
+        memory_locked=_lock_memory(libc),
+    )
+
+
+def _libc() -> ctypes.CDLL | None:
+    """Return a handle on libc for the raw syscalls, or ``None`` if absent."""
+    try:
+        return ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    except OSError:
+        return None
+
+
+def _clear_dumpable(libc: ctypes.CDLL | None) -> bool:
+    """``prctl(PR_SET_DUMPABLE, 0)`` — return ``True`` on success."""
+    if libc is None:
+        return False
+    return libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) == 0
+
+
+def _zero_core_limit() -> bool:
+    """Pin ``RLIMIT_CORE`` to ``(0, 0)`` — return ``True`` on success."""
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        return False
+    return True
+
+
+def _lock_memory(libc: ctypes.CDLL | None) -> bool:
+    """``mlockall(MCL_CURRENT | MCL_FUTURE)`` — return ``True`` on success.
+
+    Best-effort: returns ``False`` (never raises) when the process lacks
+    the privilege to lock memory, which is the common rootless-container
+    case.
+    """
+    if libc is None:
+        return False
+    return libc.mlockall(_MCL_CURRENT | _MCL_FUTURE) == 0
+
+
+__all__ = ["HardeningReport", "harden_self"]

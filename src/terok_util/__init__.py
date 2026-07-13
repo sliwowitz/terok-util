@@ -38,6 +38,9 @@ What lives here, by module:
   [`deep_merge`][terok_util.config_stack.deep_merge]).
 * [`security`][terok_util.security] — untrusted-string TTY sanitiser
   ([`sanitize_tty`][terok_util.security.sanitize_tty]).
+* [`hardening`][terok_util.hardening] — process self-hardening floor
+  ([`harden_self`][terok_util.hardening.harden_self],
+  [`HardeningReport`][terok_util.hardening.HardeningReport]).
 * [`podman`][terok_util.podman] — rootless ``--userns=keep-id`` builder
   ([`podman_userns_args`][terok_util.podman.podman_userns_args]).
 * [`matrix`][terok_util.matrix] — the shared multi-distro test-matrix
@@ -64,6 +67,9 @@ from .config_stack import ConfigStack, deep_merge
 
 # ── Filesystem helpers ────────────────────────────────────────────
 from .fs import ensure_dir, ensure_dir_writable, write_sensitive_file
+
+# ── Process self-hardening ────────────────────────────────────────
+from .hardening import HardeningReport, harden_self
 
 # ── Best-effort file logger ───────────────────────────────────────
 from .logging import BestEffortLogger
@@ -97,11 +103,13 @@ __all__ = [
     "CommandDef",
     "CommandTree",
     "ConfigStack",
+    "HardeningReport",
     "KeyRow",
     "LazyHandler",
     "deep_merge",
     "ensure_dir",
     "ensure_dir_writable",
+    "harden_self",
     "config_file_paths",
     "host_uid",
     "namespace_config_dir",
