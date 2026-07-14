@@ -348,7 +348,9 @@ class CommandTree:
         the [`CommandDef`][terok_util.cli_types.CommandDef] declared.
         Async handlers are detected and run via ``asyncio.run`` so
         consumers don't need separate dispatch paths per handler
-        flavour.
+        flavour.  A handler that returns an ``int`` exits the process
+        with that status (``None`` — the usual return — is a clean
+        exit 0), so exit codes a handler computes reach the shell.
         """
         cmd: CommandDef | None = getattr(args, "_cmd", None)
         if cmd is None:
@@ -366,7 +368,15 @@ class CommandTree:
         if inspect.iscoroutine(result):
             import asyncio  # noqa: PLC0415
 
-            asyncio.run(result)
+            result = asyncio.run(result)
+        # A handler that returns an ``int`` means it as a process exit
+        # status — propagate it so the code survives to the shell (a
+        # supervisor's wrapper-retry code, a child's failure code).
+        # ``None`` (the common case) and every other return type stay a
+        # clean exit 0.  ``bool`` is excluded: it subclasses ``int`` but a
+        # handler returning ``True``/``False`` means success, not code 1/0.
+        if isinstance(result, int) and not isinstance(result, bool):
+            raise SystemExit(result)
 
 
 # ── Module-private helpers ─────────────────────────────────────────

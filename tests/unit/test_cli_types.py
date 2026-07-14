@@ -226,6 +226,36 @@ class TestWireAndDispatch:
         CommandTree.dispatch(args)
         assert called == [1]
 
+    def _dispatch(self, handler: object) -> None:
+        tree = CommandTree([_leaf("v", handler=handler)])
+        parser = argparse.ArgumentParser()
+        tree.wire(parser)
+        CommandTree.dispatch(parser.parse_args(["v"]))
+
+    def test_int_return_becomes_exit_code(self) -> None:
+        """A handler returning an ``int`` exits the process with that status."""
+        with pytest.raises(SystemExit) as exc:
+            self._dispatch(lambda: 3)
+        assert exc.value.code == 3
+
+    def test_async_int_return_becomes_exit_code(self) -> None:
+        """The awaited result of an async handler propagates the same way."""
+
+        async def handler() -> int:
+            return 2
+
+        with pytest.raises(SystemExit) as exc:
+            self._dispatch(handler)
+        assert exc.value.code == 2
+
+    def test_none_return_is_clean_exit(self) -> None:
+        """The common ``None`` return does not raise — a clean exit 0."""
+        self._dispatch(lambda: None)
+
+    def test_bool_return_is_not_an_exit_code(self) -> None:
+        """``bool`` subclasses ``int`` but means success, not exit code 1/0."""
+        self._dispatch(lambda: True)
+
     def test_slash_separated_arg_names_expand_to_short_plus_long(self) -> None:
         """``ArgDef(name="-t/--timeout", ...)`` registers both flags under one dest."""
         captured: dict[str, int] = {}
