@@ -12,6 +12,7 @@ container host.
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import Any
 import pytest
 
 from terok_util.matrix import cli, runner
+from terok_util.matrix.catalog import SLOT_SERVICE, SYSTEM_BUS_SOCKET_UNIT, SYSTEMD_INIT
 from unit.matrix_fixtures import load_fixture, write_config
 
 
@@ -37,20 +39,6 @@ class RecordedRun:
         """Record the argv and return the scripted completed process."""
         self.calls.append(list(argv))
         return SimpleNamespace(returncode=self.returncode, stdout=self.stdout, stderr=self.stderr)
-
-
-class ScriptedRuns:
-    """``subprocess.run`` that replays one ``(returncode, stdout)`` per call."""
-
-    def __init__(self, *results: tuple[int, str]) -> None:
-        self.results = list(results)
-        self.calls: list[list[str]] = []
-
-    def __call__(self, argv: list[str], **_kwargs: Any) -> SimpleNamespace:
-        """Record the argv and hand back the next scripted result."""
-        self.calls.append(list(argv))
-        returncode, stdout = self.results.pop(0) if self.results else (0, "")
-        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
 
 
 # ── runner: build / run / prune ────────────────────────────────────
@@ -777,73 +765,135 @@ def test_matrix_parallel_jobs_tags_lines_and_keeps_the_summary(
 
 # ── runner: the booted (systemd PID 1) slot shape ──────────────────
 
-_BOOTED = "terok-fixture-test-debian13"
 
+def _booted_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    ships_systemd: bool = True,
+    exit_status: str | None = "0\n",
+) -> tuple[Any, Path, RecordedRun, RecordedPopen]:
+    """Wire a krun debian13 slot onto a scripted image probe and a recorded run.
 
-def _booted_slot_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: tuple[int, str]
-) -> tuple[Any, ScriptedRuns, RecordedPopen]:
-    """Wire a krun systemd slot onto scripted podman calls; return (config, runs, popen)."""
+    *exit_status* is what the slot service leaves on the results mount;
+    ``None`` leaves nothing, as a script that never finished does.
+    """
     config = replace(load_fixture(tmp_path), krun=True)
-    runs = ScriptedRuns((0, ""), probe, (0, ""))
+    probe = RecordedRun(returncode=0 if ships_systemd else 1)
     popen = RecordedPopen(["hello"])
-    monkeypatch.setattr(runner.subprocess, "run", runs)
+    monkeypatch.setattr(runner.subprocess, "run", probe)
     monkeypatch.setattr(runner.subprocess, "Popen", popen)
-    return config, runs, popen
-
-
-def test_booted_slot_starts_detached_waits_execs_and_stops(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """The systemd shape is four podman calls in order: run -d, boot wait, exec, stop."""
-    config, runs, popen = _booted_slot_runs(tmp_path, monkeypatch, (0, "running\n"))
     results = tmp_path / "results"
     results.mkdir()
     (results / "debian13.podman-version").write_text("5.4.2\n", encoding="utf-8")
+    if exit_status is not None:
+        (results / "debian13.exit").write_text(exit_status, encoding="utf-8")
+    return config, results, probe, popen
+
+
+def test_booted_slot_is_one_attached_run_with_its_units_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An image probe, then one streamed ``podman run`` of systemd: no exec, no stop."""
+    config, results, probe, popen = _booted_slot(tmp_path, monkeypatch)
 
     result = runner.run_slot(config, "debian13", results, line_prefix="[debian13] ")
 
     assert result.passed
     assert result.observed == "5.4.2"
-    started, wait, stop = runs.calls
-    assert started[:3] == ["podman", "run", "-d"]
-    assert started[-1] == "/sbin/init"
-    assert wait == ["podman", "exec", _BOOTED, "systemctl", "is-system-running", "--wait"]
-    assert stop == ["podman", "stop", "-t", "5", _BOOTED]
+    (probed,) = probe.calls
+    assert probed[:4] == ["podman", "run", "--rm", "--network=none"]
+    # systemd, and the system bus its user manager cannot start without
+    assert probed[-6:] == [
+        f"{config.image_prefix}:debian13",
+        "-x",
+        SYSTEMD_INIT,
+        "-a",
+        "-e",
+        SYSTEM_BUS_SOCKET_UNIT,
+    ]
     (streamed,) = popen.calls
-    assert streamed == ["podman", "exec", "-i", _BOOTED, "bash", "/results/outer-debian13.sh"]
-    assert "-t" not in streamed  # a pty would re-wrap the streamed lines
-    # the same streaming loop as the foreground shape: tagged, line by line
+    assert "KRUN_INIT_PID1=1" in streamed
+    assert SYSTEMD_INIT in streamed
+    assert (results / "systemd-debian13" / SLOT_SERVICE).is_file()
+    # nobody answers the console: no first-boot prompt, no login
+    for masked in ("systemd-firstboot.service", "console-getty.service"):
+        assert (results / "systemd-debian13" / masked).readlink() == Path(os.devnull)
+    assert "must boot systemd as PID 1" in (results / "outer-debian13.sh").read_text()
+    # the same streaming loop as the plain shape: tagged, line by line
     assert "[debian13] hello" in capsys.readouterr().out
 
 
-def test_booted_slot_counts_a_degraded_boot_as_booted(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """systemd finished booting with an unrelated unit failed — the tests still run."""
-    config, runs, popen = _booted_slot_runs(tmp_path, monkeypatch, (1, "degraded\n"))
-    results = tmp_path / "results"
-    results.mkdir()
-    (results / "debian13.podman-version").write_text("5.4.2\n", encoding="utf-8")
-
-    assert runner.run_slot(config, "debian13", results).passed
-
-    assert popen.calls, "a degraded boot must still get the outer script"
-
-
-def test_booted_slot_that_never_comes_up_fails_with_the_reason(
+def test_booted_slot_lines_lose_the_libkrun_console_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """No usable boot: no exec, the state is named, and the container is stopped anyway."""
-    config, runs, popen = _booted_slot_runs(tmp_path, monkeypatch, (2, "maintenance\n"))
+    """The console reaches podman as ERROR log records; the slot log shows plain lines."""
+    config, results, _probe, popen = _booted_slot(tmp_path, monkeypatch)
+    popen.lines = [
+        "[2026-09-10T17:07:18.965615Z ERROR init_or_kernel] --- init system: PID1=systemd ---",
+        "[2026-09-10T17:07:19.000000Z ERROR init_or_kernel] [missing newline]partial",
+    ]
+
+    runner.run_slot(config, "debian13", results, line_prefix="[debian13] ")
+
+    out = capsys.readouterr().out
+    assert "[debian13] --- init system: PID1=systemd ---" in out
+    assert "[debian13] partial" in out
+    assert "init_or_kernel" not in out
+
+
+def test_booted_slot_takes_its_verdict_from_the_recorded_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """podman's status is the VM's, which rebooted cleanly; the file says the tests failed."""
+    config, results, _probe, _popen = _booted_slot(tmp_path, monkeypatch, exit_status="3\n")
+
+    assert not runner.run_slot(config, "debian13", results).passed
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "said"),
+    [(None, "outer script never finished"), ("TERM\n", "outer script was ended by TERM")],
+)
+def test_booted_slot_without_a_numeric_status_fails_with_a_line_saying_why(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    exit_status: str | None,
+    said: str,
+) -> None:
+    """A hung boot, a crashed systemd, a killed script: the slot fails and says which."""
+    config, results, _probe, _popen = _booted_slot(tmp_path, monkeypatch, exit_status=exit_status)
+
+    assert not runner.run_slot(config, "debian13", results).passed
+    assert f"FATAL: the debian13 slot's {said}" in capsys.readouterr().out
+
+
+def test_krun_slot_whose_image_ships_no_systemd_runs_the_plain_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """debian12's podman image has no systemd: the outer script runs under libkrun's init."""
+    config, results, _probe, popen = _booted_slot(
+        tmp_path, monkeypatch, ships_systemd=False, exit_status=None
+    )
+
+    assert runner.run_slot(config, "debian13", results).passed
+    (streamed,) = popen.calls
+    assert streamed[-2:] == ["bash", "/results/outer-debian13.sh"]
+    assert "KRUN_INIT_PID1=1" not in streamed
+    assert not (results / "systemd-debian13").exists()
+
+
+def test_no_image_probe_where_no_systemd_may_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without krun no slot boots systemd, so no probe container runs."""
+    probe = RecordedRun()
+    monkeypatch.setattr(runner.subprocess, "run", probe)
+    monkeypatch.setattr(runner.subprocess, "Popen", RecordedPopen([]))
     results = tmp_path / "results"
     results.mkdir()
 
-    result = runner.run_slot(config, "debian13", results)
+    runner.run_slot(load_fixture(tmp_path), "debian13", results)
 
-    assert not result.passed
-    assert popen.calls == []
-    assert runs.calls[-1] == ["podman", "stop", "-t", "5", _BOOTED]
-    out = capsys.readouterr().out
-    assert "did not boot systemd" in out
-    assert "maintenance" in out
+    assert probe.calls == []

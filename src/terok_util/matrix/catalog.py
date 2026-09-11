@@ -61,24 +61,26 @@ KRUN_RUNTIME = "krun"
 # rootless podman, so the host already has it.
 KRUN_PASST_ANNOTATION = "krun.use_passt=1"
 
-# Under krun the slot's rootfs is virtiofs, which root-squashes the subuid
-# ``mkdir``/``chown`` rootless podman does as it unpacks/runs images
-# (virtiofsd runs as the host user).  A loop-mounted ext4 image is a
-# guest-kernel-owned filesystem where those ids resolve; the nested-podman
-# store and buildah's per-``RUN``-step rootfs (``TMPDIR``) live on it.  The
-# mount point is ``TMPDIR`` itself and is deliberately short: pytest hangs
-# ``tmp_path`` off ``TMPDIR``, and the socket tests would blow the 107-byte
-# ``AF_UNIX`` limit under a long prefix.  The image lives in the container's
-# own (``--rm``-cleaned) rootfs, sparse — the size is a ceiling against a
-# runaway pull, not an allocation.
+# Under krun the slot's rootfs is virtiofs, served by the host: it stamps
+# files with the host clock, which runs ahead of the guest's, and it
+# root-squashes the subuid ``mkdir``/``chown`` rootless podman does as it
+# unpacks/runs images (virtiofsd runs as the host user).  A loop-mounted ext4
+# image is a guest-kernel-owned filesystem with neither trait.  Every krun
+# container slot keeps ``TMPDIR`` and the uv cache on it; the nested-podman
+# slots also bind their store there.  The mount point is ``TMPDIR`` itself
+# and is deliberately short: pytest hangs ``tmp_path`` off ``TMPDIR``, and
+# the socket tests would blow the 107-byte ``AF_UNIX`` limit under a long
+# prefix.  The image lives in the container's own (``--rm``-cleaned) rootfs,
+# sparse — the size is a ceiling against a runaway pull, not an allocation.
 KRUN_DISK_IMG = "/krun-disk.img"
 KRUN_DISK_SIZE = "16G"
 KRUN_DISK_MOUNT = "/kd"
 
-#: The image's own init, run as PID 1 by the slots that boot systemd under
-#: krun (see [`SlotSpec.boots_systemd`][terok_util.matrix.catalog.SlotSpec.boots_systemd]).
-#: Every systemd distro ships it, so the path needs no per-slot override.
-SYSTEMD_INIT = "/sbin/init"
+#: The systemd a booted slot runs as PID 1 (see
+#: [`SlotSpec.may_boot_systemd`][terok_util.matrix.catalog.SlotSpec.may_boot_systemd]).
+#: The binary itself, not ``/sbin/init``: Debian ships that link apart, in
+#: ``systemd-sysv``.  The runner checks the built image for this path.
+SYSTEMD_INIT = "/usr/lib/systemd/systemd"
 
 #: ``/proc/1/comm`` of a booted systemd — what the init-system proof compares
 #: against to tell a real PID 1 systemd from an init shim.
@@ -88,6 +90,24 @@ SYSTEMD_COMM = "systemd"
 #: it explicitly is what gives the test user a ``/run/user/<uid>`` and a
 #: reachable ``systemd --user`` on images whose PAM stack lacks ``pam_systemd``.
 USER_MANAGER_UNIT = "user@{uid}.service"
+
+#: The system bus a booted slot's image must ship with its systemd.
+#: ``user-runtime-dir@`` connects to it before it creates ``/run/user/<uid>``
+#: and exits when it cannot, so without a bus no user manager starts; Debian
+#: and Ubuntu only recommend one.
+SYSTEM_BUS_SOCKET_UNIT = "/usr/lib/systemd/system/dbus.socket"
+
+#: Where a booted slot's units are mounted: systemd's control directory, the
+#: first unit path it reads, empty in every image and outside ``/run``, which
+#: the booted systemd covers with a fresh tmpfs.
+SYSTEMD_CONTROL_DIR = "/etc/systemd/system.control"
+
+#: The unit a booted slot's systemd starts instead of ``default.target``: the
+#: normal boot, then the slot's outer script.
+BOOT_TARGET = "terok-matrix.target"
+
+#: The oneshot service that runs the outer script inside a booted slot.
+SLOT_SERVICE = "terok-matrix-slot.service"
 
 # Shared Containerfile families a matrix.yml may select.
 FLAVORS = ("podman", "dbus")
@@ -143,18 +163,20 @@ class SlotSpec:
 
         True only for a container-kind slot on the ``podman`` flavor: the nix
         slot has no podman inside, and the dbus flavor runs none.  This gates
-        the resolv.conf fix and, under krun, the device/disk/tmp setup.
+        the resolv.conf fix and, under krun, the device setup and store binds.
         """
         return flavor == "podman" and self.kind is SlotKind.CONTAINER
 
-    def boots_systemd(self, flavor: str, krun: bool) -> bool:
-        """Whether this slot runs systemd as PID 1 instead of the outer script.
+    def may_boot_systemd(self, flavor: str, krun: bool) -> bool:
+        """Whether this slot boots systemd as PID 1, where its image ships one.
 
         Only under krun: the microVM owns its kernel and cgroup tree, so the
         image's systemd can be PID 1 and give the tests a real per-user
         manager.  Under a shared kernel the slot stays a plain ``--init``
         container, and the systemd-free floor slots stay systemd-free
-        everywhere.
+        everywhere.  The runner still checks the built image: a slot boots
+        only a systemd and system bus its image already has, and the matrix
+        installs neither.
         """
         return krun and self.runs_nested_podman(flavor) and not self.non_systemd
 

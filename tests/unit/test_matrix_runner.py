@@ -28,6 +28,10 @@ def test_every_catalog_slot_has_a_template_per_flavor(tmp_path: Path) -> None:
             assert "{%" not in rendered and "{{" not in rendered, (flavor, name)
             if spec.kind is not SlotKind.NIX:
                 assert "$EXTRA_PACKAGES" in rendered, (flavor, name)
+                assert "e2fsprogs" in rendered, (flavor, name)  # mkfs for the krun disk
+            # Only a nested podman pulls images, so only it gets the mirrors.
+            mirrored = "registries.conf.d" in rendered
+            assert mirrored is spec.runs_nested_podman(flavor), (flavor, name)
 
 
 def test_shared_blocks_render_with_their_slot_knobs(tmp_path: Path) -> None:
@@ -123,44 +127,52 @@ def test_run_argv_injects_krun_runtime_and_kvm_when_enabled(tmp_path: Path) -> N
     assert krun_argv[krun_argv.index("--annotation") + 1] == "krun.use_passt=1"
 
 
-def test_run_argv_boots_systemd_as_pid1_for_krun_slots_that_ship_it(tmp_path: Path) -> None:
-    """Under krun a systemd slot runs its own init; the systemd-free floor does not."""
+def test_only_krun_podman_slots_off_the_systemd_free_floor_may_boot_systemd() -> None:
+    """Booting systemd is for krun runs of nested-podman slots on systemd distros."""
+    from terok_util.matrix.catalog import SLOTS
+
+    assert SLOTS["debian13"].may_boot_systemd("podman", krun=True)
+    assert not SLOTS["debian13"].may_boot_systemd("podman", krun=False)
+    assert not SLOTS["debian13"].may_boot_systemd("dbus", krun=True)
+    assert not SLOTS["alpine"].may_boot_systemd("podman", krun=True)
+    assert not SLOTS["nix"].may_boot_systemd("podman", krun=True)
+
+
+def test_run_argv_boots_systemd_as_pid1_when_the_runner_says_so(tmp_path: Path) -> None:
+    """The booted shape runs the image's systemd as PID 1, with the slot's units mounted."""
     from dataclasses import replace
 
-    config = load_fixture(tmp_path)
+    from terok_util.matrix.catalog import BOOT_TARGET, SYSTEMD_CONTROL_DIR, SYSTEMD_INIT
+
     results = tmp_path / "results"
-    krun = replace(config, krun=True)
-
-    debian13 = _run_argv(krun, "debian13", results)
-    assert "--systemd=always" in debian13
-    # catatonit in front of systemd would leave the tests without a user manager.
-    assert "--init" not in debian13
-    assert debian13[-1] == "/sbin/init"
-    # Everything else about the krun run is unchanged.
-    assert "--privileged" in debian13
-    assert debian13[debian13.index("--runtime") + 1] == "krun"
-    assert "/dev/kvm:rw" in debian13
-
-    # The floor slots have no systemd to boot, and no run without --krun does.
-    alpine = _run_argv(krun, "alpine", results)
-    assert "--init" in alpine
-    assert alpine[-2:] == ["bash", "/results/outer-alpine.sh"]
-    assert "--systemd=always" not in _run_argv(config, "debian13", results)
-
-
-def test_run_argv_detached_only_adds_the_flag(tmp_path: Path) -> None:
-    """The booted shape is the same command line, backgrounded — podman would
-    otherwise never return from a container whose command is its init."""
-    from dataclasses import replace
-
     krun = replace(load_fixture(tmp_path), krun=True)
-    results = tmp_path / "results"
 
-    foreground = _run_argv(krun, "debian13", results)
-    detached = _run_argv(krun, "debian13", results, detached=True)
+    booted = _run_argv(krun, "debian13", results, boots_systemd=True)
+    # podman's systemd mode would mount a host tmpfs over the guest's /run.
+    assert "--systemd=false" in booted
+    # catatonit in front of systemd would leave the tests without a user manager.
+    assert "--init" not in booted
+    # libkrun's init execs the command instead of forking it, so systemd is PID 1.
+    assert booted[booted.index("KRUN_INIT_PID1=1") - 1] == "-e"
+    assert f"{results}/systemd-debian13:{SYSTEMD_CONTROL_DIR}:ro,z" in booted
+    assert booted[-4:] == [
+        SYSTEMD_INIT,
+        f"--unit={BOOT_TARGET}",
+        "--show-status=no",
+        "--log-level=warning",
+    ]
+    # One attached run: nothing detaches, and nothing goes in through exec later.
+    assert "-d" not in booted
+    # Everything else about the krun run is unchanged.
+    assert "--privileged" in booted
+    assert booted[booted.index("--runtime") + 1] == "krun"
+    assert "/dev/kvm:rw" in booted
 
-    assert detached[:3] == ["podman", "run", "-d"]
-    assert detached[3:] == foreground[2:]
+    # Without the runner's call, the outer script is the container command.
+    plain = _run_argv(krun, "debian13", results)
+    assert "--init" in plain
+    assert "KRUN_INIT_PID1=1" not in plain
+    assert plain[-2:] == ["bash", "/results/outer-debian13.sh"]
 
 
 def test_krun_outer_starts_the_user_manager_and_proves_systemd_is_pid1(tmp_path: Path) -> None:
@@ -173,17 +185,40 @@ def test_krun_outer_starts_the_user_manager_and_proves_systemd_is_pid1(tmp_path:
     config = load_fixture(tmp_path)
     krun = replace(config, krun=True)
 
-    debian13 = outer_script(krun, "debian13")
+    debian13 = outer_script(krun, "debian13", boots_systemd=True)
     assert 'systemctl start "user@$(id -u testrunner).service"' in debian13
     assert "FATAL: user manager for testrunner did not start" in debian13
     assert "must boot systemd as PID 1" in debian13
     # The manager is up before the tests inherit XDG_RUNTIME_DIR through ``su``.
     assert debian13.index("systemctl start") < debian13.index("exec su - testrunner")
 
-    # Not for the systemd-free floor, and not for a shared-kernel run.
+    # Not where the runner boots no systemd: an image without one, the
+    # systemd-free floor, a shared-kernel run.
+    assert "systemctl start" not in outer_script(krun, "debian13")
+    assert "must boot systemd as PID 1" not in outer_script(krun, "debian13")
     assert "systemctl start" not in outer_script(krun, "alpine")
     assert "systemctl start" not in outer_script(config, "debian13")
-    assert "must boot systemd as PID 1" not in outer_script(config, "debian13")
+
+
+def test_boot_units_run_the_outer_script_and_hand_back_its_status() -> None:
+    """A booted slot's systemd runs the outer script on the console, records its
+    exit status, and ends the VM whatever the outcome, a hung boot included."""
+    from terok_util.matrix.catalog import BOOT_TARGET, SLOT_SERVICE
+    from terok_util.matrix.inner import boot_units
+
+    units = boot_units("debian13")
+
+    service = units[SLOT_SERVICE]
+    # A pipe as the script's stdout, as in the plain shape; the status is the script's.
+    assert '-o pipefail -c "/bin/bash /results/outer-debian13.sh 2>&1 | cat"' in service
+    # The console is what libkrun hands to the container's stdout.
+    assert "StandardOutput=tty" in service
+    assert '"$$EXIT_STATUS" > /results/debian13.exit' in service
+    assert "SuccessAction=reboot-force" in service
+    assert "FailureAction=reboot-force" in service
+    assert f"Requires=multi-user.target {SLOT_SERVICE}" in units[BOOT_TARGET]
+    boot_deadline = units["multi-user.target.d/terok-matrix-boot.conf"]
+    assert "JobTimeoutAction=reboot-force" in boot_deadline
 
 
 def test_inner_script_signals_kernel_isolation_only_under_krun(tmp_path: Path) -> None:
@@ -209,17 +244,6 @@ def test_krun_inner_moves_the_uv_cache_onto_the_guest_disk(tmp_path: Path) -> No
     assert f"UV_CACHE_DIR={KRUN_DISK_MOUNT}/uv-cache" in inner_script(
         replace(config, krun=True), "debian13"
     )
-
-
-def test_krun_outer_nudges_the_guest_clock(tmp_path: Path) -> None:
-    """Under krun the outer script advances the clock so build mtimes aren't 'future'."""
-    from dataclasses import replace
-
-    from terok_util.matrix.inner import outer_script
-
-    config = load_fixture(tmp_path)
-    assert "date -s" not in outer_script(config, "debian13")  # crun shares the host clock
-    assert "date -s '+2 seconds'" in outer_script(replace(config, krun=True), "debian13")
 
 
 def test_krun_outer_recreates_dev_std_symlinks(tmp_path: Path) -> None:
@@ -267,8 +291,8 @@ def test_krun_podman_slot_ext4_disk_for_store_and_short_tmpdir(tmp_path: Path) -
     # runroot resolv.conf under keep-id, which virtiofs squashes); path stays put.
     # Only where systemd does not own /run/user/<uid>: on a booted slot that
     # bind would hide the user manager's sockets from the test user.
-    assert 'mount --bind /kd/run /run/user/"$(id -u testrunner)"' in outer_script(krun, "alpine")
-    assert "mount --bind /kd/run" not in outer
+    assert 'mount --bind /kd/run /run/user/"$(id -u testrunner)"' in outer
+    assert "mount --bind /kd/run" not in outer_script(krun, "debian13", boots_systemd=True)
     # No workspace bind: fuse-overlayfs drives the context overlay on virtiofs.
     assert "mount --bind /kd/workspace" not in outer
     # TMPDIR is the short mount point itself (buildah RUN-step rootfs on ext4;
@@ -277,9 +301,29 @@ def test_krun_podman_slot_ext4_disk_for_store_and_short_tmpdir(tmp_path: Path) -
 
     assert "mkfs.ext4" not in outer_script(config, "debian13")  # crun overlay works direct
     assert "TMPDIR=/kd" not in inner_script(config, "debian13")
-    assert "mkfs.ext4" not in outer_script(krun, "nix")  # nix runs no nested podman
-    dbus = load_fixture(tmp_path / "dbus", minimal_yml(flavor="dbus"))
-    assert "mkfs.ext4" not in outer_script(replace(dbus, krun=True), "debian13")
+    assert "mkfs.ext4" not in outer_script(krun, "nix")  # the nix image has no mkfs.ext4
+
+
+def test_krun_dbus_slot_builds_on_the_ext4_disk(tmp_path: Path) -> None:
+    """A krun slot without nested podman still builds off virtiofs; the clock stays untouched.
+
+    virtiofs stamps host-clock mtimes, ahead of the guest clock, so meson saw
+    dbus-python's build dir as future-dated.  libkrun's time sync resets any
+    nudge to the guest clock.
+    """
+    from dataclasses import replace
+
+    from terok_util.matrix.inner import inner_script, outer_script
+
+    dbus = replace(load_fixture(tmp_path, minimal_yml(flavor="dbus")), krun=True)
+
+    outer = outer_script(dbus, "debian13")
+    assert "mount -o loop /krun-disk.img /kd" in outer
+    assert "/kd/store" not in outer  # no nested podman, so no store to bind
+    assert "date -s" not in outer
+    inner = inner_script(dbus, "debian13")
+    assert "export TMPDIR=/kd\n" in inner
+    assert "export UV_CACHE_DIR=/kd/uv-cache" in inner
 
 
 def test_run_argv_stamps_the_ownership_label_explicitly(tmp_path: Path) -> None:
