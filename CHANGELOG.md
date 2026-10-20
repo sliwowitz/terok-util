@@ -40,6 +40,13 @@ release scope (Tier 1 + Tier 2 per
   that lived in `terok`).
 - `podman` — `podman_userns_args`. Rootless `--userns=keep-id`
   builder.
+
+### Changed
+
+- `require_setup` reports an owner whose receipt is missing as `not set up yet`
+  instead of listing every absent artifact, and asks to "Run setup" rather than
+  "Run setup again" when nothing was ever set up.
+
 ## v0.4.0 — At Your Service
 
 ## What's Changed
