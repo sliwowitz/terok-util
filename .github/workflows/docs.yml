@@ -63,7 +63,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
 
@@ -117,7 +117,7 @@ jobs:
 
       - name: Coverage artifact (master — same SHA, required)
         if: github.ref == 'refs/heads/master'
-        uses: dawidd6/action-download-artifact@634d83b91986fcec9be314054943fa5c976aeb0e # v25
+        uses: dawidd6/action-download-artifact@eab87c9830c39eff17e5a6eadb20bfb4bc880477 # v27
         with:
           workflow: analysis.yml
           workflow_conclusion: success
@@ -132,7 +132,7 @@ jobs:
       # same-SHA artifact here instead.
       - name: Coverage artifact (non-master — same SHA, best effort)
         if: github.ref != 'refs/heads/master'
-        uses: dawidd6/action-download-artifact@634d83b91986fcec9be314054943fa5c976aeb0e # v25
+        uses: dawidd6/action-download-artifact@eab87c9830c39eff17e5a6eadb20bfb4bc880477 # v27
         with:
           workflow: analysis.yml
           workflow_conclusion: completed
@@ -143,7 +143,7 @@ jobs:
 
       - name: Coverage artifact (non-master — fall back to latest master)
         if: github.ref != 'refs/heads/master' && !hashFiles('reports/coverage.json')
-        uses: dawidd6/action-download-artifact@634d83b91986fcec9be314054943fa5c976aeb0e # v25
+        uses: dawidd6/action-download-artifact@eab87c9830c39eff17e5a6eadb20bfb4bc880477 # v27
         with:
           workflow: analysis.yml
           workflow_conclusion: success
