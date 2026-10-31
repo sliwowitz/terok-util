@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import signal
+import sys
 from dataclasses import replace
+from importlib.util import spec_from_file_location
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +19,7 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from terok_util.matrix import ci, cli, config, runner
+from terok_util.matrix import _files, ci, cli, config, runner
 from terok_util.matrix._files import read_regular
 from terok_util.matrix.catalog import INPUTS_MOUNT, OWNERSHIP_LABEL, RESULTS_MOUNT
 from unit.matrix_fixtures import load_fixture, minimal_yml, write_config
@@ -111,7 +114,8 @@ def test_ci_reuses_engine_with_separate_slot_outputs(
 
     def execute(config, name, results, **kwargs):
         """Record the policy passed to the engine without invoking Podman."""
-        assert config.ci and config.krun
+        assert config.ci
+        assert config.krun
         assert config.image_prefix == "ci-run-1"
         outputs.append(results)
         return runner.SlotResult(True, "5.0")
@@ -211,7 +215,8 @@ def test_cleanup_uses_only_trusted_namespace(
     listing, removal = invoke.call_args_list
     assert f"label={OWNERSHIP_LABEL}=ci-run-1" in listing.args[0]
     assert removal.args[0] == [str(host_podman), "rm", "-f", "-t", "0", "one", "two"]
-    assert listing.kwargs["check"] and removal.kwargs["check"]
+    assert listing.kwargs["check"]
+    assert removal.kwargs["check"]
 
 
 def test_cli_rejects_extra_flags(source: Path, tmp_path: Path) -> None:
@@ -350,3 +355,60 @@ def test_workload_output_without_newlines_is_streamed_in_bounded_chunks(
     assert max(map(len, chunks)) <= runner._STREAM_CHUNK_CHARS + len(prefix)
     assert len(chunks) == 4
     assert all(call.args == (runner._STREAM_CHUNK_CHARS,) for call in read.call_args_list)
+
+
+@pytest.mark.parametrize("arguments", [[], ["--cleanup", "run-1", "--krun"]])
+def test_cli_rejects_incomplete_or_conflicting_options(arguments: list[str]) -> None:
+    """Malformed supervisor invocations fail before creating or cleaning resources."""
+    with pytest.raises(SystemExit) as error:
+        ci.main(arguments)
+    assert error.value.code == 2
+
+
+def test_missing_checkout_is_rejected(tmp_path: Path) -> None:
+    """The worker must prepare the checkout before invoking the engine."""
+    with pytest.raises(ValueError, match="existing checkout"):
+        ci.run_ci(tmp_path / "missing", tmp_path / "output", "run-1")
+
+
+def test_module_entrypoint_rejects_invalid_cleanup_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The isolated-Python module entry point propagates the CLI failure code."""
+    monkeypatch.setattr(ci, "__spec__", spec_from_file_location(ci.__name__, ci.__file__))
+    monkeypatch.setattr(sys, "argv", [ci.__name__, "--cleanup", "invalid!"])
+    with (
+        pytest.warns(RuntimeWarning, match="found in sys.modules"),
+        pytest.raises(SystemExit) as error,
+    ):
+        runpy.run_module(ci.__name__, run_name="__main__", alter_sys=True)
+    assert error.value.code == 2
+
+
+def test_result_growth_after_stat_is_still_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An output writer cannot evade the read limit by growing a previously small file."""
+    path = tmp_path / "result"
+    path.write_text("ok")
+    original_stat = os.fstat
+
+    def grow_after_stat(descriptor: int):
+        """Grow the opened inode after the size check receives its initial metadata."""
+        metadata = original_stat(descriptor)
+        path.write_text("this no longer fits")
+        return metadata
+
+    monkeypatch.setattr(_files.os, "fstat", grow_after_stat)
+    with pytest.raises(OSError, match="exceeds"):
+        read_regular(path, limit=4)
+
+
+def test_late_fragment_is_rejected_before_build(tmp_path: Path) -> None:
+    """The renderer enforces CI policy even if a fragment appears after preparation."""
+    declaration = replace(load_fixture(tmp_path / "repo"), ci=True)
+    fragments = declaration.containers_dir / "fragments"
+    fragments.mkdir()
+    (fragments / "Containerfile.debian13").write_text("RUN false\n")
+    with pytest.raises(ValueError, match="fragments"):
+        runner.render_containerfile(declaration, "debian13")

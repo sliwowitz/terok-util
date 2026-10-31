@@ -555,6 +555,7 @@ def _run_argv(
         f"{results_dir}:{RESULTS_MOUNT}:rw,z",
     ]
     inputs = _inputs_dir(config, results_dir)
+    inputs_mount = INPUTS_MOUNT if config.ci else RESULTS_MOUNT
     if config.ci:
         argv += ["-v", f"{inputs}:{INPUTS_MOUNT}:ro,z"]
     if boots_systemd:
@@ -565,7 +566,7 @@ def _run_argv(
     argv += (
         [spec.boot_init, f"--unit={BOOT_TARGET}", "--show-status=no", "--log-level=warning"]
         if boots_systemd
-        else ["bash", _outer_in_container(slot_name, INPUTS_MOUNT if config.ci else RESULTS_MOUNT)]
+        else ["bash", _outer_in_container(slot_name, inputs_mount)]
     )
     return argv
 
