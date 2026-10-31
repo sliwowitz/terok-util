@@ -137,6 +137,19 @@ class TestEnsureDir:
         ensure_dir(tmp_path / "new")
         assert account_group[1] == []
 
+    def test_root_keeps_created_directory_group(
+        self, tmp_path: Path, account_group: tuple[int, list[int]], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Root creates the directory without account lookup or group adjustment."""
+        monkeypatch.setattr(os, "geteuid", lambda: 0)
+        lookup = Mock()
+        monkeypatch.setattr("terok_util.fs.pwd.getpwuid", lookup)
+        target = tmp_path / "new"
+        ensure_dir(target)
+        assert target.is_dir()
+        assert account_group[1] == []
+        lookup.assert_not_called()
+
     def test_setup_lock_creates_safe_shared_parents(
         self, tmp_path: Path, account_group: tuple[int, list[int]], monkeypatch: pytest.MonkeyPatch
     ) -> None:
