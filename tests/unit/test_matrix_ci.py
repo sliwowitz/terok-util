@@ -9,13 +9,14 @@ import json
 import os
 import signal
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from terok_util.matrix import ci, cli, runner
+from terok_util.matrix import ci, cli, config, runner
 from terok_util.matrix._files import read_regular
 from terok_util.matrix.catalog import INPUTS_MOUNT, OWNERSHIP_LABEL, RESULTS_MOUNT
 from unit.matrix_fixtures import load_fixture, minimal_yml, write_config
@@ -272,3 +273,80 @@ def test_cli_runs_the_selected_immutable_checkout(
         == 1
     )
     execute.assert_called_once_with(source, output, "run-1", slots=("debian13",), krun=True, jobs=1)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        ("image-prefix: t", "image-prefix: {nested: [not, a, string]}"),
+        ("image-prefix: t", "image-prefix: true"),
+        ("flavor: podman", "flavor: 1"),
+        ("  debian13:", "  debian13: false"),
+        ("  debian13:", "  debian13:\n    groups: [false]"),
+        ("  debian13:", "  debian13:\n    skip: []"),
+        ("  debian13:", "  debian13:\n    phases: false"),
+        ("  debian13:", "  true:"),
+        ("name: all", "name: [not, a, string]"),
+        ("pytest: tests/ -v", "run: [{not: a-string}]"),
+        ("image-prefix: t", "true: t"),
+    ],
+)
+def test_ci_rejects_non_string_fields_before_coercion(
+    source: Path, tmp_path: Path, original: str, replacement: str
+) -> None:
+    """Malformed nested values are rejected rather than recursively stringified."""
+    write_config(source, minimal_yml().replace(original, replacement))
+    with pytest.raises(config.MatrixConfigError):
+        ci.run_ci(source, tmp_path / "output", "run-1")
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("image-prefix: &cycle [*cycle]", "aliases"),
+        ("a: &a [x, x]\nb: &b [*a, *a]\nc: [*b, *b]", "aliases"),
+        ("a: " + "[" * 20 + "x" + "]" * 20, "nesting"),
+        ("a: [" + ",".join("x" for _ in range(5000)) + "]", "event"),
+    ],
+)
+def test_ci_yaml_limits_precede_object_construction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, reason: str
+) -> None:
+    """Alias graphs and excessive structure never reach the YAML constructor."""
+    construct = Mock(side_effect=AssertionError("unsafe construction"))
+    monkeypatch.setattr(config, "yaml_load", construct)
+    with pytest.raises(config.MatrixConfigError, match=reason):
+        config._parse_config(tmp_path / "matrix.yml", text, strict=True)
+    construct.assert_not_called()
+
+
+def test_developer_config_retains_scalar_coercion(tmp_path: Path) -> None:
+    """The restricted policy does not change existing local declarations."""
+    declaration = load_fixture(
+        tmp_path, minimal_yml().replace("image-prefix: t", "image-prefix: 42")
+    )
+    assert declaration.image_prefix == "42"
+
+
+def test_workload_output_without_newlines_is_streamed_in_bounded_chunks(
+    monkeypatch: pytest.MonkeyPatch, host_podman: Path
+) -> None:
+    """A hostile unterminated line cannot accumulate unbounded runner memory."""
+    content = "x" * (runner._STREAM_CHUNK_CHARS * 3 + 7)
+    stream = StringIO(content)
+    read = Mock(side_effect=stream.readline)
+    process = MagicMock()
+    process.__enter__.return_value = process
+    process.stdout = SimpleNamespace(readline=read)
+    process.wait.return_value = 0
+    monkeypatch.setattr(runner.subprocess, "Popen", Mock(return_value=process))
+    output = Mock()
+    prefix = "[slot] "
+    with monkeypatch.context() as context:
+        context.setattr(runner.sys, "stdout", output)
+        assert runner._stream([str(host_podman), "run"], prefix) == (0, None)
+    chunks = [call.args[0] for call in output.write.call_args_list]
+    assert "".join(chunks) == prefix + content
+    assert max(map(len, chunks)) <= runner._STREAM_CHUNK_CHARS + len(prefix)
+    assert len(chunks) == 4
+    assert all(call.args == (runner._STREAM_CHUNK_CHARS,) for call in read.call_args_list)

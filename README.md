@@ -97,12 +97,14 @@ checkout. `report.json` uses the normal report format. CI runs slots serially;
 `--jobs` accepts only `1`. Namespace identifiers contain 1–48 lowercase
 alphanumeric/hyphen characters and must start with an alphanumeric character.
 
-CI rejects repository Containerfile fragments, symlinked declarations and unsafe
-package names. It builds packaged templates with an empty build context and
+CI rejects repository Containerfile fragments, symlinked declarations, YAML aliases,
+non-string text fields and unsafe package names. YAML nesting and event counts are
+bounded before object construction. It builds packaged templates with an empty build context and
 replaces the declared image prefix with the worker's run namespace. Test phases
 and dependency installation still execute inside the workload. Each slot gets
 readonly generated inputs and its own writable outputs. Result collection rejects
-symlinks, special files, invalid UTF-8 and oversized files.
+symlinks, special files, invalid UTF-8 and oversized files. Workload output is
+streamed in bounded chunks even when it contains no newlines.
 
 After stopping an engine process group, a supervisor can remove that run's
 containers without consulting the checkout:

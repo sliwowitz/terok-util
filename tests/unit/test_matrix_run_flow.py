@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -767,7 +768,7 @@ class RecordedPopen:
     @property
     def stdout(self) -> Any:
         """The scripted output lines, newline-terminated like a real pipe."""
-        return iter(f"{line}\n" for line in self.lines)
+        return StringIO("".join(f"{line}\n" for line in self.lines))
 
     def wait(self) -> int:
         """The scripted exit code."""

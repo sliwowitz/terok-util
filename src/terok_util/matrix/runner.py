@@ -81,6 +81,7 @@ _NETWORK_ERROR_SIGNATURES = (
     "failed to establish a new connection",  # urllib3/requests
     "tls handshake timeout",
 )
+_STREAM_CHUNK_CHARS = 65536
 
 
 def _network_error_signature(line: str) -> str | None:
@@ -211,12 +212,14 @@ def _stream(
         ) as proc
     ):
         stdout = cast(IO[str], proc.stdout)  # guaranteed non-None by stdout=PIPE
-        for raw in stdout:
-            line = strip.sub("", raw, count=1) if strip else raw
-            sys.stdout.write(f"{line_prefix}{line}")
+        line_start = True
+        while raw := stdout.readline(_STREAM_CHUNK_CHARS):
+            line = strip.sub("", raw, count=1) if strip and line_start else raw
+            sys.stdout.write(f"{line_prefix if line_start else ''}{line}")
             sys.stdout.flush()
             if net_hint is None:
                 net_hint = _network_error_signature(line)
+            line_start = raw.endswith("\n")
         status = proc.wait()
     return status, net_hint
 

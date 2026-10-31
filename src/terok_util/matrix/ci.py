@@ -148,7 +148,7 @@ def _prepare(
     if jobs != 1:
         raise ValueError("CI currently requires jobs=1")
     path = repo / cli.DEFAULT_CONFIG
-    config = _parse_config(path, read_regular(path))
+    config = _parse_config(path, read_regular(path), strict=True)
     fragments = config.containers_dir / "fragments"
     if fragments.exists() or fragments.is_symlink():
         raise MatrixConfigError("CI does not accept repository Containerfile fragments")

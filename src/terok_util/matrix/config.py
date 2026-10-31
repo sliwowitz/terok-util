@@ -20,6 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ruamel.yaml import YAML
+from ruamel.yaml.events import AliasEvent, CollectionEndEvent, CollectionStartEvent
+
 from terok_util.yaml import load as yaml_load
 
 from .catalog import FLAVORS, SLOTS
@@ -31,6 +34,8 @@ class MatrixConfigError(ValueError):
 
 #: Pytest-phase scopes selectable from the CLI (``--unit-only`` / ``--integ-only``).
 SCOPES = ("unit", "integ")
+_CI_MAX_YAML_DEPTH = 16
+_CI_MAX_YAML_EVENTS = 4096
 
 
 @dataclass(frozen=True)
@@ -151,13 +156,15 @@ def load_config(path: Path) -> MatrixConfig:
     return _parse_config(path, path.read_text(encoding="utf-8"))
 
 
-def _parse_config(path: Path, text: str) -> MatrixConfig:
+def _parse_config(path: Path, text: str, *, strict: bool = False) -> MatrixConfig:
     """Parse a declaration already read by the caller's filesystem policy."""
+    if strict:
+        _validate_ci_yaml(text)
     raw = yaml_load(text)
     if not isinstance(raw, dict):
         raise MatrixConfigError(f"{path}: expected a YAML mapping at top level")
 
-    data = _Section(dict(raw), where=str(path))
+    data = _Section(dict(raw), where=str(path), strict=strict)
     flavor = data.string("flavor")
     if flavor not in FLAVORS:
         raise MatrixConfigError(f"{path}: unknown flavor '{flavor}'; known: {list(FLAVORS)}")
@@ -166,8 +173,8 @@ def _parse_config(path: Path, text: str) -> MatrixConfig:
         flavor=flavor,
         groups=data.strings("groups", default=("test",)),
         expect=data.strings("expect", default=()),
-        slots=_parse_slots(data.mapping("slots"), where=str(path)),
-        phases=_parse_phases(data.list_of_maps("phases"), where=str(path)),
+        slots=_parse_slots(data.mapping("slots"), where=str(path), strict=strict),
+        phases=_parse_phases(data.list_of_maps("phases"), where=str(path), strict=strict),
         containers_dir=path.parent.resolve(),
         repo_root=path.parent.parent.parent.resolve(),
     )
@@ -178,7 +185,28 @@ def _parse_config(path: Path, text: str) -> MatrixConfig:
 # ── Parse helpers ──────────────────────────────────────────────────
 
 
-def _parse_slots(raw: dict[str, Any], where: str) -> dict[str, SlotConfig]:
+def _validate_ci_yaml(text: str) -> None:
+    """Reject aliases and excessive structure before YAML constructs Python values.
+
+    CI declarations do not need alias graphs. Rejecting them before construction
+    avoids both recursive values and repeated expansion during string conversion.
+    The event parser bounds nesting without traversing a constructed object graph.
+    """
+    depth = 0
+    for count, event in enumerate(YAML(typ="safe", pure=True).parse(text), start=1):
+        if count > _CI_MAX_YAML_EVENTS:
+            raise MatrixConfigError("CI declaration exceeds the YAML event limit")
+        if isinstance(event, AliasEvent):
+            raise MatrixConfigError("CI declarations do not allow YAML aliases")
+        if isinstance(event, CollectionStartEvent):
+            depth += 1
+            if depth > _CI_MAX_YAML_DEPTH:
+                raise MatrixConfigError("CI declaration exceeds the YAML nesting limit")
+        elif isinstance(event, CollectionEndEvent):
+            depth -= 1
+
+
+def _parse_slots(raw: dict[str, Any], where: str, *, strict: bool = False) -> dict[str, SlotConfig]:
     """Validate slot names against the catalog and parse their options."""
     unknown = set(raw) - set(SLOTS)
     if unknown:
@@ -187,8 +215,10 @@ def _parse_slots(raw: dict[str, Any], where: str) -> dict[str, SlotConfig]:
         )
     slots: dict[str, SlotConfig] = {}
     for name, options in raw.items():
-        section = _Section(dict(options or {}), where=f"{where}: slot {name}")
-        skip = _Section(section.mapping("skip"), where=f"{where}: slot {name}: skip")
+        if strict and options is not None and not isinstance(options, dict):
+            raise MatrixConfigError(f"{where}: slot {name} must be a mapping or null")
+        section = _Section(dict(options or {}), where=f"{where}: slot {name}", strict=strict)
+        skip = _Section(section.mapping("skip"), where=f"{where}: slot {name}: skip", strict=strict)
         slots[name] = SlotConfig(
             extra_packages=section.strings("extra-packages", default=()),
             skip_arches=skip.strings("arches", default=()),
@@ -206,14 +236,16 @@ def _parse_slot_phases(section: _Section, where: str) -> tuple[Phase, ...] | Non
     """Parse a slot-level ``phases`` override, if declared."""
     if "phases" not in section.data:
         return None
-    return _parse_phases(section.list_of_maps("phases"), where=where)
+    return _parse_phases(section.list_of_maps("phases"), where=where, strict=section.strict)
 
 
-def _parse_phases(raw: list[dict[str, Any]], where: str) -> tuple[Phase, ...]:
+def _parse_phases(
+    raw: list[dict[str, Any]], where: str, *, strict: bool = False
+) -> tuple[Phase, ...]:
     """Parse the ordered phase list."""
     phases = []
     for entry in raw:
-        section = _Section(dict(entry), where=where)
+        section = _Section(dict(entry), where=where, strict=strict)
         phase = Phase(
             name=section.string("name"),
             run=section.strings("run", default=()),
@@ -245,6 +277,12 @@ class _Section:
 
     data: dict[str, Any]
     where: str = ""
+    strict: bool = False
+
+    def __post_init__(self) -> None:
+        """Keep CI mapping keys textual before formatting unknown-field errors."""
+        if self.strict and any(not isinstance(key, str) for key in self.data):
+            raise MatrixConfigError(f"{self.where}: mapping keys must be strings")
 
     def string(self, key: str, default: str | None = None) -> str:
         """Pop a string value; required when no default is given."""
@@ -253,6 +291,8 @@ class _Section:
             if default is None:
                 raise MatrixConfigError(f"{self.where}: missing required key '{key}'")
             return default
+        if self.strict and not isinstance(value, str):
+            raise MatrixConfigError(f"{self.where}: '{key}' must be a string")
         return str(value)
 
     def strings(self, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -267,6 +307,8 @@ class _Section:
             return None
         if not isinstance(value, list):
             raise MatrixConfigError(f"{self.where}: '{key}' must be a list")
+        if self.strict and any(not isinstance(item, str) for item in value):
+            raise MatrixConfigError(f"{self.where}: '{key}' must contain only strings")
         return tuple(str(item) for item in value)
 
     def boolean(self, key: str, default: bool) -> bool:
@@ -280,14 +322,20 @@ class _Section:
 
     def mapping(self, key: str) -> dict[str, Any]:
         """Pop a nested mapping, empty when absent."""
-        value = self.data.pop(key, None) or {}
+        value = self.data.pop(key, None)
+        if value is None or (not self.strict and not value):
+            value = {}
         if not isinstance(value, dict):
             raise MatrixConfigError(f"{self.where}: '{key}' must be a mapping")
+        if self.strict and any(not isinstance(item, str) for item in value):
+            raise MatrixConfigError(f"{self.where}: '{key}' mapping keys must be strings")
         return dict(value)
 
     def list_of_maps(self, key: str) -> list[dict[str, Any]]:
         """Pop a list of mappings, empty when absent."""
-        value = self.data.pop(key, None) or []
+        value = self.data.pop(key, None)
+        if value is None or (not self.strict and not value):
+            value = []
         if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
             raise MatrixConfigError(f"{self.where}: '{key}' must be a list of mappings")
         return [dict(item) for item in value]
