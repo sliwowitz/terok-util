@@ -29,8 +29,10 @@ from jinja2 import Environment, PackageLoader, StrictUndefined
 from terok_util.host_tools import find_host_tool, require_host_tool
 from terok_util.security import sanitize_tty
 
+from ._files import read_regular
 from .catalog import (
     BOOT_TARGET,
+    INPUTS_MOUNT,
     KRUN_PASST_ANNOTATION,
     KRUN_RUNTIME,
     OWNERSHIP_LABEL,
@@ -113,6 +115,10 @@ def render_containerfile(config: MatrixConfig, slot_name: str) -> str:
         uv_python_dir=UV_MANAGED_PYTHON_DIR,
     )
     fragment = config.containers_dir / "fragments" / f"Containerfile.{slot_name}"
+    if config.ci:
+        if fragment.exists() or fragment.is_symlink():
+            raise ValueError("CI does not accept repository Containerfile fragments")
+        return rendered
     if fragment.is_file():
         rendered += "\n" + fragment.read_text(encoding="utf-8")
     return rendered
@@ -121,9 +127,13 @@ def render_containerfile(config: MatrixConfig, slot_name: str) -> str:
 def build_image(
     config: MatrixConfig, slot_name: str, results_dir: Path, no_cache: bool = False
 ) -> bool:
-    """Assemble and build the slot image; the repo root is the build context."""
+    """Build a slot image; CI uses an empty context instead of repository sources."""
     containerfile = results_dir / f"Containerfile.{slot_name}"
     containerfile.write_text(render_containerfile(config, slot_name), encoding="utf-8")
+    context = config.repo_root
+    if config.ci:
+        context = results_dir / "build-context"
+        context.mkdir(mode=0o700, exist_ok=True)
     argv = [
         require_host_tool("podman"),
         "build",
@@ -142,7 +152,7 @@ def build_image(
         f"{config.image_prefix}:{slot_name}",
         "-f",
         str(containerfile),
-        str(config.repo_root),
+        str(context),
     ]
     return subprocess.run(argv, check=False).returncode == 0  # nosec B603
 
@@ -278,10 +288,10 @@ def _run_in_booted_slot(
         strip=_KRUN_CONSOLE_PREFIX,
     )
     try:
-        recorded = (results_dir / f"{slot_name}.exit").read_text(encoding="utf-8").strip()
-    except OSError:
+        recorded = read_regular(results_dir / f"{slot_name}.exit", limit=16).strip()
+    except (OSError, UnicodeError):
         recorded = ""
-    if recorded.isdigit():
+    if recorded.isascii() and recorded.isdecimal() and len(recorded) <= 3:
         return int(recorded), net_hint
     # The file is written inside the test container - sanitize before it
     # reaches the operator's terminal.  One line: a tagged parallel run tags
@@ -330,15 +340,20 @@ def sweep_containers(config: MatrixConfig) -> int:
     Returns:
         The number of containers removed.
     """
+    return _sweep_namespace(config.image_prefix)
+
+
+def _sweep_namespace(image_prefix: str, *, check: bool = False) -> int:
+    """Sweep a known ownership label without reading any repository declaration."""
     listing = subprocess.run(  # nosec B603 - fixed argv, resolved host executable
         [
             require_host_tool("podman"),
             "ps",
             "-aq",
             "--filter",
-            f"label={OWNERSHIP_LABEL}={config.image_prefix}",
+            f"label={OWNERSHIP_LABEL}={image_prefix}",
         ],
-        check=False,
+        check=check,
         capture_output=True,
         text=True,
     )
@@ -347,7 +362,7 @@ def sweep_containers(config: MatrixConfig) -> int:
         return 0
     subprocess.run(  # nosec B603 - fixed argv, resolved host executable
         [require_host_tool("podman"), "rm", "-f", "-t", _REMOVAL_GRACE_SECONDS, *container_ids],
-        check=False,
+        check=check,
         capture_output=True,
         text=True,
     )
@@ -422,18 +437,31 @@ def _write_scripts(
     config: MatrixConfig, slot_name: str, results_dir: Path, scope: str, boots_systemd: bool
 ) -> None:
     """Drop the generated scripts, and a booted slot's units, where the container mounts them."""
-    outer = results_dir / f"outer-{slot_name}.sh"
+    inputs = _inputs_dir(config, results_dir)
+    inputs.mkdir(parents=True, exist_ok=True)
+    outer = inputs / f"outer-{slot_name}.sh"
     outer.write_text(outer_script(config, slot_name, boots_systemd=boots_systemd), encoding="utf-8")
-    inner = results_dir / f"inner-{slot_name}.sh"
+    inner = inputs / f"inner-{slot_name}.sh"
     inner.write_text(inner_script(config, slot_name, scope), encoding="utf-8")
     if boots_systemd:
-        units = _units_dir(results_dir, slot_name)
+        units = _units_dir(inputs, slot_name)
         units.mkdir(parents=True, exist_ok=True)
-        for relative, text in boot_units(slot_name).items():
+        mount = INPUTS_MOUNT if config.ci else RESULTS_MOUNT
+        for relative, text in boot_units(slot_name, inputs_mount=mount).items():
             (units / relative).parent.mkdir(parents=True, exist_ok=True)
             (units / relative).write_text(text, encoding="utf-8")
         for masked in MASKED_UNITS:
             (units / masked).symlink_to(os.devnull)
+
+
+def slot_results_dir(config: MatrixConfig, results_dir: Path, slot_name: str) -> Path:
+    """Give CI slots separate writable mounts, preserving the developer layout."""
+    return results_dir / slot_name / "outputs" if config.ci else results_dir
+
+
+def _inputs_dir(config: MatrixConfig, results_dir: Path) -> Path:
+    """Keep CI scripts outside the workload's writable output directory."""
+    return results_dir.parent / "inputs" if config.ci else results_dir
 
 
 def _units_dir(results_dir: Path, slot_name: str) -> Path:
@@ -446,9 +474,9 @@ def _container_name(config: MatrixConfig, slot_name: str) -> str:
     return f"{config.image_prefix}-{slot_name}"
 
 
-def _outer_in_container(slot_name: str) -> str:
+def _outer_in_container(slot_name: str, inputs_mount: str = RESULTS_MOUNT) -> str:
     """The slot's root-side script, as the container sees it on the results mount."""
-    return f"{RESULTS_MOUNT}/outer-{slot_name}.sh"
+    return f"{inputs_mount}/outer-{slot_name}.sh"
 
 
 def _run_argv(
@@ -523,15 +551,18 @@ def _run_argv(
         "-v",
         f"{results_dir}:{RESULTS_MOUNT}:rw,z",
     ]
+    inputs = _inputs_dir(config, results_dir)
+    if config.ci:
+        argv += ["-v", f"{inputs}:{INPUTS_MOUNT}:ro,z"]
     if boots_systemd:
-        argv += ["-v", f"{_units_dir(results_dir, slot_name)}:{SYSTEMD_CONTROL_DIR}:ro,z"]
+        argv += ["-v", f"{_units_dir(inputs, slot_name)}:{SYSTEMD_CONTROL_DIR}:ro,z"]
     argv.append(f"{config.image_prefix}:{slot_name}")
     # A booted slot's systemd starts the target that runs the outer script
     # (see boot_units); without status lines and info logs the log stays the slot's.
     argv += (
         [spec.boot_init, f"--unit={BOOT_TARGET}", "--show-status=no", "--log-level=warning"]
         if boots_systemd
-        else ["bash", _outer_in_container(slot_name)]
+        else ["bash", _outer_in_container(slot_name, INPUTS_MOUNT if config.ci else RESULTS_MOUNT)]
     )
     return argv
 
@@ -540,8 +571,8 @@ def _observed_version(slot_name: str, results_dir: Path) -> str:
     """What the inner script recorded — may be missing if it died early."""
     stem = "python" if SLOTS[slot_name].kind is SlotKind.NIX else "podman"
     try:
-        recorded = (results_dir / f"{slot_name}.{stem}-version").read_text(encoding="utf-8")
-    except OSError:
+        recorded = read_regular(results_dir / f"{slot_name}.{stem}-version")
+    except (OSError, UnicodeError):
         return "?"
     # The file is written inside the test container - sanitize before it
     # reaches the operator's terminal via the summary.

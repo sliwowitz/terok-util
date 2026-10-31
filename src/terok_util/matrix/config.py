@@ -105,6 +105,8 @@ class MatrixConfig:
         krun: Run each slot as a libkrun microVM (its own kernel) instead of a
             shared-kernel container.  A run-mode set from ``--krun``, not from
             ``matrix.yml`` — the CLI injects it after the declaration loads.
+        ci: Restrict builds to packaged templates and separate generated inputs
+            from workload outputs. Only the CI entry point enables this policy.
     """
 
     image_prefix: str
@@ -117,6 +119,7 @@ class MatrixConfig:
     repo_root: Path
     krun: bool = False
     host_confines_pasta: bool = False
+    ci: bool = False
 
     def slot_groups(self, name: str) -> tuple[str, ...]:
         """Dependency groups effective for slot ``name``."""
@@ -145,7 +148,12 @@ def load_config(path: Path) -> MatrixConfig:
         MatrixConfigError: On unknown keys, unknown slots, or a phase that
             is neither a command phase nor a pytest phase.
     """
-    raw = yaml_load(path.read_text(encoding="utf-8"))
+    return _parse_config(path, path.read_text(encoding="utf-8"))
+
+
+def _parse_config(path: Path, text: str) -> MatrixConfig:
+    """Parse a declaration already read by the caller's filesystem policy."""
+    raw = yaml_load(text)
     if not isinstance(raw, dict):
         raise MatrixConfigError(f"{path}: expected a YAML mapping at top level")
 

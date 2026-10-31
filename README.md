@@ -78,3 +78,40 @@ A build-only run leaves successful slots `built`, not `passed`.
 Consumers can poll this file without parsing terminal output. SIGTERM and Ctrl-C
 finalize the report; SIGKILL cannot, so the supervising process must report that
 interruption. Configuration errors before execution may leave no report.
+
+## Restricted matrix execution for CI
+
+`terok-matrix-ci` runs a disposable checkout with a separately installed engine.
+It does not change `terok-matrix` or the editable development workflow. A worker
+should invoke its trusted interpreter with isolated Python imports:
+
+```bash
+/opt/matrix-worker/bin/python -I -m terok_util.matrix.ci \
+    --repo /srv/matrix/checkouts/approved-sha \
+    --output /srv/matrix/runs/new-run \
+    --namespace run-123 --krun -- debian13 fedora44
+```
+
+The output directory must not exist. Its parent must already exist outside the
+checkout. `report.json` uses the normal report format. CI runs slots serially;
+`--jobs` accepts only `1`. Namespace identifiers contain 1–48 lowercase
+alphanumeric/hyphen characters and must start with an alphanumeric character.
+
+CI rejects repository Containerfile fragments, symlinked declarations and unsafe
+package names. It builds packaged templates with an empty build context and
+replaces the declared image prefix with the worker's run namespace. Test phases
+and dependency installation still execute inside the workload. Each slot gets
+readonly generated inputs and its own writable outputs. Result collection rejects
+symlinks, special files, invalid UTF-8 and oversized files.
+
+After stopping an engine process group, a supervisor can remove that run's
+containers without consulting the checkout:
+
+```bash
+/opt/matrix-worker/bin/python -I -m terok_util.matrix.ci --cleanup run-123
+```
+
+The caller remains responsible for immutable approved commits, credentials,
+network restrictions, deadlines and resource limits. `--krun` isolates test
+kernels; trusted image builds and image probes still use the host's default
+runtime. Privileged Podman execution is not a hostile-code security boundary.

@@ -27,6 +27,7 @@ from __future__ import annotations
 from .catalog import (
     BOOT_TARGET,
     EXPECT_ENV,
+    INPUTS_MOUNT,
     KERNEL_ISOLATED_ENV,
     KRUN_DISK_IMG,
     KRUN_DISK_MOUNT,
@@ -79,7 +80,8 @@ def outer_script(config: MatrixConfig, slot_name: str, *, boots_systemd: bool = 
         lines += _init_system_proof(slot_name, boots_systemd)
     if spec.runs_nested_podman(config.flavor):
         lines += _resolv_conf_strip()
-    lines += ["", f"install -m 0755 {RESULTS_MOUNT}/inner-{slot_name}.sh /tmp/inner.sh"]
+    inputs = INPUTS_MOUNT if config.ci else RESULTS_MOUNT
+    lines += ["", f"install -m 0755 {inputs}/inner-{slot_name}.sh /tmp/inner.sh"]
     if boots_systemd:
         lines += _start_user_manager(spec.user)
     lines += [*_user_drop(spec.user, spec.kind), ""]
@@ -121,7 +123,7 @@ BOOT_TIMEOUT_SECONDS = 300
 MASKED_UNITS = ("systemd-firstboot.service", "console-getty.service")
 
 
-def boot_units(slot_name: str) -> dict[str, str]:
+def boot_units(slot_name: str, *, inputs_mount: str = RESULTS_MOUNT) -> dict[str, str]:
     """The units a booted slot runs through, keyed by path under the control dir.
 
     crun's krun handler implements no exec, so nothing reaches a booted
@@ -151,7 +153,7 @@ def boot_units(slot_name: str) -> dict[str, str]:
         # A pipe, not the console, is the script's stdout, as in the plain shape:
         # nothing draws progress bars for a terminal nobody watches.
         f"ExecStart={shell}{login} -o pipefail -c"
-        f' "{shell} {RESULTS_MOUNT}/outer-{slot_name}.sh 2>&1 | cat"',
+        f' "{shell} {inputs_mount}/outer-{slot_name}.sh 2>&1 | cat"',
         f"ExecStopPost={shell} -c 'echo \"$$EXIT_STATUS\" > {RESULTS_MOUNT}/{slot_name}.exit'",
         "StandardOutput=tty",
         "TTYPath=/dev/console",

@@ -22,7 +22,9 @@ Collaborators, in reading order:
   inside a slot's test container;
 * [`runner`][terok_util.matrix.runner] — host-side build/run/prune;
 * [`cli`][terok_util.matrix.cli] — the ``terok-matrix`` entry point
-  (``uv run terok-matrix`` from a consuming repo's root).
+  (``uv run terok-matrix`` from a consuming repo's root);
+* [`ci`][terok_util.matrix.ci] — restricted execution with a separately
+  installed engine, disposable sources and isolated per-slot outputs.
 
 External tooling (the superbuild TUI, CI matrix generation) should not
 shell-parse anything: load the same ``matrix.yml`` via

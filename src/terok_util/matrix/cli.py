@@ -35,6 +35,7 @@ from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 
+from ._files import read_regular
 from .catalog import SLOTS, SlotKind
 from .config import MatrixConfig, MatrixConfigError, load_config
 from .jobserver import Jobserver
@@ -45,6 +46,7 @@ from .runner import (
     external_storage_leftovers,
     prune_dangling,
     run_slot,
+    slot_results_dir,
     sweep_containers,
 )
 
@@ -251,7 +253,7 @@ def _walk_matrix(
             continue
         runnable.append(name)
 
-    jobserver = Jobserver.from_environ() if len(runnable) > 1 else None
+    jobserver = Jobserver.from_environ() if len(runnable) > 1 and not config.ci else None
     # Under a make jobserver its tokens set the pace; an explicit --jobs still caps it.
     jobs = args.jobs or (len(runnable) if jobserver else 1)
     if jobs > 1 and len(runnable) > 1:
@@ -265,7 +267,11 @@ def _walk_matrix(
     for name in runnable:
         (passed if results[name].passed else failed).append(name)
 
-    within = {name: counts for name in runnable if (counts := _read_slot_skips(results_dir, name))}
+    within = {
+        name: counts
+        for name in runnable
+        if (counts := _read_slot_skips(slot_results_dir(config, results_dir, name), name))
+    }
     _print_summary(config, passed, skipped, failed, results, within)
     return 1 if failed else 0
 
@@ -358,6 +364,10 @@ def _run_reported_slot(
 ) -> SlotResult:
     """Run a slot and publish its verdict before the rest of the matrix finishes."""
     report.update(name, "testing")
+    results_dir = slot_results_dir(config, results_dir, name)
+    if config.ci:
+        results_dir.mkdir(parents=True)
+        results_dir.chmod(0o1777)
     result = run_slot(
         config,
         name,
@@ -430,7 +440,7 @@ def _read_slot_skips(results_dir: Path, name: str) -> dict[str, dict[str, int]]:
     """
     path = results_dir / f"{name}.skips.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(read_regular(path))
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict) or set(data) != {"matrix", "pytest"}:
